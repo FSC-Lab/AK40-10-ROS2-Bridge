@@ -20,4 +20,4 @@ ak_motor_node:
     command_timeout_ms: 500.0
     kd_watchdog: 0.05  # Nms/rad damping applied on timeout
     temp_limit_c: 75.0 # auto-disable threshold in actual Celsius (raw byte - 40)
-    heartbeat_timeout_ms: 1000.0 # auto-disable if no heartbeat received within this window (ms)
+    heartbeat_timeout_ms: 300.0 # auto-disable if no heartbeat received within this window (ms)
