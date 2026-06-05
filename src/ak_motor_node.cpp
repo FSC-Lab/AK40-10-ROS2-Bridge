@@ -7,6 +7,7 @@
 #include <std_msgs/msg/u_int8.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/empty.hpp>
 
 #include "ak_motor_driver/ak40_codec.hpp"
 #include "ak_motor_driver/can_socket.hpp"
@@ -33,6 +34,7 @@ class AkMotorNode : public rclcpp::Node {
     declare_parameter("command_timeout_ms", 500.0);
     declare_parameter("kd_watchdog", 0.5);
     declare_parameter("temp_limit_c", 75.0);
+    declare_parameter("heartbeat_timeout_ms", 1000.0);
 
     const std::string can_iface = get_parameter("can_interface").as_string();
     const uint8_t motor_id = static_cast<uint8_t>(get_parameter("motor_id").as_int());
@@ -41,9 +43,10 @@ class AkMotorNode : public rclcpp::Node {
 
     kp_ = get_parameter("kp").as_double();
     kd_ = get_parameter("kd").as_double();
-    command_timeout_ms_ = get_parameter("command_timeout_ms").as_double();
-    kd_watchdog_  = get_parameter("kd_watchdog").as_double();
-    temp_limit_c_ = get_parameter("temp_limit_c").as_double();
+    command_timeout_ms_   = get_parameter("command_timeout_ms").as_double();
+    kd_watchdog_          = get_parameter("kd_watchdog").as_double();
+    temp_limit_c_         = get_parameter("temp_limit_c").as_double();
+    heartbeat_timeout_ms_ = get_parameter("heartbeat_timeout_ms").as_double();
 
     Ak40Limits limits;
     limits.p_min  = get_parameter("p_min").as_double();
@@ -78,6 +81,17 @@ class AkMotorNode : public rclcpp::Node {
     cmd_sub_ = create_subscription<sensor_msgs::msg::JointState>(
         "~/command", 10,
         [this](const sensor_msgs::msg::JointState::SharedPtr msg) { on_command(msg); });
+
+    heartbeat_sub_ = create_subscription<std_msgs::msg::Empty>(
+        "~/heartbeat", 10,
+        [this](const std_msgs::msg::Empty::SharedPtr) {
+          last_heartbeat_time_ = now();
+          if (!heartbeat_alive_) {
+            heartbeat_alive_ = true;
+            RCLCPP_INFO(get_logger(), "Heartbeat regained — re-enable motor to resume");
+          }
+          has_heartbeat_ = true;
+        });
 
     enable_srv_ = create_service<std_srvs::srv::Trigger>(
         "~/enable",
@@ -136,6 +150,24 @@ class AkMotorNode : public rclcpp::Node {
     has_command_ = true;
   }
 
+  void check_heartbeat() {
+    // No heartbeat ever received — local testing without ground station, allow operation.
+    if (!has_heartbeat_) { return; }
+
+    const double elapsed_ms = (now() - last_heartbeat_time_).nanoseconds() / 1e6;
+    const bool alive = elapsed_ms <= heartbeat_timeout_ms_;
+
+    if (heartbeat_alive_ && !alive) {
+      heartbeat_alive_ = false;
+      if (enabled_) {
+        can_socket_->write(codec_->exit_mit_mode());
+        enabled_ = false;
+      }
+      RCLCPP_WARN(get_logger(),
+                  "Heartbeat lost (%.0f ms since last) — motor auto-disabled", elapsed_ms);
+    }
+  }
+
   void send_command() {
     MitCommand cmd;
     const double elapsed_ms = (now() - last_cmd_time_).nanoseconds() / 1e6;
@@ -156,6 +188,7 @@ class AkMotorNode : public rclcpp::Node {
   }
 
   void poll_can() {
+    check_heartbeat();
     if (enabled_) { send_command(); }
 
     while (can_socket_->is_open()) {
@@ -207,6 +240,7 @@ class AkMotorNode : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr       temp_pub_;
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr cmd_sub_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr          heartbeat_sub_;
 
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr enable_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr disable_srv_;
@@ -224,6 +258,10 @@ class AkMotorNode : public rclcpp::Node {
   double       command_timeout_ms_{500.0};
   double       kd_watchdog_{0.5};
   double       temp_limit_c_{75.0};
+  rclcpp::Time last_heartbeat_time_{0, 0, RCL_ROS_TIME};
+  bool         has_heartbeat_{false};
+  bool         heartbeat_alive_{false};
+  double       heartbeat_timeout_ms_{1000.0};
 };
 
 }  // namespace ak_motor_driver

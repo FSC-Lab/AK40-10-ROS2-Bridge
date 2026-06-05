@@ -30,6 +30,8 @@ Three layers, each in its own library or executable:
 
 **Watchdog safety:** if `~/command` goes stale beyond `command_timeout_ms`, the node drops to `kp=0, kd=kd_watchdog` — pure damping, no position tracking. Keep `kd_watchdog` low (default 0.05) to avoid heating the motor at idle.
 
+**Heartbeat watchdog:** the node subscribes to `~/heartbeat` (`std_msgs/Empty`). If a heartbeat has ever been received and then stops arriving for longer than `heartbeat_timeout_ms` (default 1000 ms), the node sends `exit_mit_mode` and clears `enabled_`. A single `[WARN]` is logged on loss and a single `[INFO]` on regain. If no heartbeat is ever received (bench/local testing), the watchdog is inactive and operation proceeds normally. The ground station must manually re-enable the motor after heartbeat is regained.
+
 **Temperature auto-disable:** after each feedback frame is decoded, temperature is checked against `temp_limit_c` (default 75°C). If exceeded, `exit_mit_mode()` is sent immediately and `enabled_` is cleared.
 
 **MIT torque formula:** `tau = kp*(p_des - p) + kd*(v_des - v) + t_ff`. Three control modes follow from this:
