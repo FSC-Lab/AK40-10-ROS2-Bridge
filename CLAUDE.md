@@ -43,6 +43,37 @@ With default `kp=1.0`, publishing a velocity command has little effect — the p
 1. Publish `~/command` before calling `~/enable` — prevents the watchdog from firing on startup.
 2. Call `~/zero_position` only while disabled — the service rejects the request otherwise.
 
+## Platform differences
+
+### CAN interface name
+
+| Platform | Interface | Notes |
+|---|---|---|
+| Ubuntu laptop (standard kernel) | `can0` | USB dongle (`gs_usb`) claims `can0` directly |
+| Jetson Orin (Tegra kernel) | `can1` | Native MTTCAN occupies `can0`; USB dongle is `can1` |
+
+Always pass `can_interface` at launch to avoid hardcoding:
+```bash
+ros2 launch ak_motor_driver ak_motor.launch.py can_interface:=can1   # Jetson
+ros2 launch ak_motor_driver ak_motor.launch.py                        # Ubuntu (defaults to can0)
+```
+
+### Jetson Orin: gs_usb not in Tegra kernel
+
+The Tegra kernel (`5.15.x-tegra`) does not ship the `gs_usb` module. Symptoms:
+- CANable dongle visible in `lsusb` but no `can1` interface appears
+- `modprobe gs_usb` fails with "not found in directory"
+
+Fix: build `gs_usb` out-of-tree once using `nvidia-l4t-kernel-headers`. Full steps are in README § Platform-specific CAN setup. After install, add `gs_usb` to `/etc/modules-load.d/gs_usb.conf` so it loads on every boot.
+
+### Jetson Orin: BUS-OFF on startup
+
+If the node starts before the motor is powered, the startup `exit_mit_mode` frame gets no ACK and the mttcan controller enters BUS-OFF (`berr-counter tx 248`). Recovery:
+```bash
+sudo ip link set can0 down && sudo ip link set can0 up
+```
+This only affects `can0` (native). The USB dongle on `can1` does not exhibit this behaviour.
+
 ## IDE false positives
 
 The VSCode IntelliSense reports errors like `"cannot open source file rclcpp/rclcpp.hpp"` and `"qualified name is not allowed"` throughout. These are IntelliSense configuration issues (missing ROS include paths). The actual `colcon build` always succeeds — ignore IntelliSense errors and verify with a real build.
