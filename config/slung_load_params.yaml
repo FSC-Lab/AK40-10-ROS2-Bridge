@@ -1,0 +1,7 @@
+slung_load_node:
+  ros__parameters:
+    direction: 1               # +1 or -1, set to match physical positive direction
+    watchdog_timeout_ms: 500.0 # zero torque if no ~/torque_cmd received within this window
+    publish_rate_hz: 50.0      # rate at which commands are sent to the motor node
+    motor_node_name: "ak_motor_node"
+    motor_name: "ak40_10"

@@ -1,0 +1,4 @@
+1. Desgin a seperate node such that it handles torque command.
+2. I need a watch dog such that if no ros2 message is sent over a given time, the torque is automatically set to 0;
+3. need a config file to set the positive direction. 
+4. the radius of the cable wheel is 2.5cm. The payload is 300g. 

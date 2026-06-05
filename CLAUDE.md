@@ -32,6 +32,13 @@ Three layers, each in its own library or executable:
 
 **Temperature auto-disable:** after each feedback frame is decoded, temperature is checked against `temp_limit_c` (default 75°C). If exceeded, `exit_mit_mode()` is sent immediately and `enabled_` is cleared.
 
+**MIT torque formula:** `tau = kp*(p_des - p) + kd*(v_des - v) + t_ff`. Three control modes follow from this:
+- **Position:** `kp>0, kd>0`, set `position` field. Motor holds position with damping.
+- **Velocity:** `kp=0, kd>0`, set `velocity` field. Motor tracks velocity; `kd` sets responsiveness.
+- **Torque-direct:** `kp=0, kd=0`, set `effort` field. Used by slung load node.
+
+With default `kp=1.0`, publishing a velocity command has little effect — the position error term dominates. Set `kp=0` first for velocity or torque modes.
+
 **Operating order matters:**
 1. Publish `~/command` before calling `~/enable` — prevents the watchdog from firing on startup.
 2. Call `~/zero_position` only while disabled — the service rejects the request otherwise.

@@ -65,6 +65,10 @@ class AkMotorNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "CAN interface '%s' opened (motor_id=%u)", can_iface.c_str(),
                 motor_id);
 
+    // Ensure the motor is not armed from a previous crashed session.
+    can_socket_->write(codec_->exit_mit_mode());
+    RCLCPP_INFO(get_logger(), "Sent exit-MIT-mode on startup (motor safe)");
+
     joint_state_pub_ =
         create_publisher<sensor_msgs::msg::JointState>("~/joint_state", 10);
     mode_pub_  = create_publisher<std_msgs::msg::Int8>("~/mode", 10);

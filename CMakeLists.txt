@@ -35,8 +35,13 @@ target_compile_features(ak_motor_node PRIVATE cxx_std_17)
 target_link_libraries(ak_motor_node can_socket ak40_codec)
 ament_target_dependencies(ak_motor_node ${_deps})
 
+# ── Slung load controller node ────────────────────────────────────────────────
+add_executable(slung_load_node src/slung_load_node.cpp)
+target_compile_features(slung_load_node PRIVATE cxx_std_17)
+ament_target_dependencies(slung_load_node ${_deps})
+
 # ── Install ───────────────────────────────────────────────────────────────────
-install(TARGETS can_socket ak40_codec ak_motor_node
+install(TARGETS can_socket ak40_codec ak_motor_node slung_load_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME})

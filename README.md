@@ -29,8 +29,14 @@ source install/setup.bash
 
 ## Launch
 
+- launch testing node:
 ```bash
 ros2 launch ak_motor_driver ak_motor.launch.py
+```
+
+- launch torque control node:
+```bash
+ros2 launch ak_motor_driver slung_load.launch.py
 ```
 
 ## Operating sequence
@@ -129,6 +135,38 @@ ros2 topic hz /ak_motor_node/joint_state
 | `p_min` / `p_max` | `-12.5` / `12.5` | Position limits (rad) |
 | `v_min` / `v_max` | `-45.5` / `45.5` | Velocity limits (rad/s) — AK40-10 spec |
 | `t_min` / `t_max` | `-5.0` / `5.0` | Torque limits (Nm) — AK40-10 spec |
+
+## Control modes
+
+The MIT protocol computes output torque as:
+
+```
+tau = kp*(p_des - p) + kd*(v_des - v) + t_ff
+```
+
+Three modes are available by choosing `kp` and `kd`:
+
+| Mode | kp | kd | Active field | Example use |
+|---|---|---|---|---|
+| Position hold | >0 | >0 | `position` | Go to angle, hold |
+| Velocity tracking | 0 | >0 | `velocity` | Spin at constant speed |
+| Torque direct | 0 | 0 | `effort` | Slung load force control |
+
+**Important:** with `kp>0` (the default), publishing a non-zero `velocity` has little effect — the position error term dominates. Switch to velocity or torque mode by zeroing `kp` first:
+
+```bash
+# Switch to velocity mode
+ros2 param set /ak_motor_node kp 0.0
+ros2 param set /ak_motor_node kd 1.0
+ros2 topic pub --rate 50 /ak_motor_node/command sensor_msgs/msg/JointState \
+  "{name: ['ak40_10'], position: [0.0], velocity: [-0.1], effort: [0.0]}"
+
+# Switch to torque-direct mode
+ros2 param set /ak_motor_node kp 0.0
+ros2 param set /ak_motor_node kd 0.0
+ros2 topic pub --rate 50 /ak_motor_node/command sensor_msgs/msg/JointState \
+  "{name: ['ak40_10'], position: [0.0], velocity: [0.0], effort: [1.0]}"
+```
 
 ## Debugging
 
