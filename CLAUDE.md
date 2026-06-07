@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build
 
 ```bash
-cd ~/source/fsc_autopilot2_ws
+cd ~/<your_ros2_workspace_root>   # e.g. ~/dev_ws, ~/ros2_ws — differs per machine
 colcon build --packages-select ak_motor_driver
 source install/setup.bash
 ```
@@ -63,6 +63,12 @@ With default `kp=1.0`, publishing a velocity command has little effect — the p
 |---|---|---|
 | Ubuntu laptop (standard kernel) | `can0` | USB dongle (`gs_usb`) claims `can0` directly |
 | Jetson Orin (Tegra kernel) | `can1` | Native MTTCAN occupies `can0`; USB dongle is `can1` |
+
+Use the setup scripts to bring up the interface before launching (run once per reboot):
+```bash
+sudo ./scripts/setup_can_orin.sh    # Jetson Orin
+sudo ./scripts/setup_can_laptop.sh  # Ubuntu laptop
+```
 
 Always pass `can_interface` at launch to avoid hardcoding:
 ```bash

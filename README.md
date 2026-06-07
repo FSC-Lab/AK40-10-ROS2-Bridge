@@ -10,15 +10,18 @@ ROS 2 driver for the CubeMars AK40-10 actuator over SocketCAN.
 
 The USB-to-CAN dongle (CANable / gs_usb compatible) appears directly as `can0`. No extra steps needed — `gs_usb` ships in the standard kernel.
 
+**Every reboot — bring up can0 (recommended):**
+
+```bash
+sudo ./scripts/setup_can_laptop.sh
+```
+
+**Backup — manual commands:**
+
 ```bash
 sudo ip link set can0 down
 sudo ip link set can0 up type can bitrate 1000000
 ip link show can0   # should show state UP, bitrate 1000000
-```
-
-Launch with the default interface:
-```bash
-ros2 launch ak_motor_driver ak_motor.launch.py
 ```
 
 #### Jetson Orin (Tegra kernel)
@@ -48,7 +51,13 @@ sudo depmod -a
 echo "gs_usb" | sudo tee /etc/modules-load.d/gs_usb.conf
 ```
 
-**Every reboot — bring up can1:**
+**Every reboot — bring up can1 (recommended):**
+
+```bash
+sudo ./scripts/setup_can_orin.sh
+```
+
+**Backup — manual commands:**
 
 ```bash
 # sudo modprobe gs_usb is NOT needed after reboot — the modules-load.d entry above handles it automatically
@@ -57,36 +66,36 @@ sudo ip link set can1 up
 ip link show can1   # should show state UP, bitrate 1000000
 ```
 
-Launch with the Jetson interface:
-```bash
-ros2 launch ak_motor_driver ak_motor.launch.py can_interface:=can1
-```
-
 > **Why can1 and not can0?** The Jetson Orin has a built-in MTTCAN controller that always claims `can0`. The USB dongle is enumerated as the next available interface, `can1`. The native `can0` requires an external CAN transceiver chip wired to the GPIO header — if you use that path instead, pass `can_interface:=can0`.
 
 ### 2. Build and source the workspace
 
 ```bash
-cd ~/source/fsc_autopilot2_ws
+cd ~/<your_ros2_workspace_root>   # e.g. ~/dev_ws, ~/ros2_ws — differs per machine
 colcon build --packages-select ak_motor_driver
 source install/setup.bash
 ```
 
 ## Launch
 
-- launch cable control node (laptop):
+### Step 1 — bring up the CAN interface (run once per reboot)
+
 ```bash
+# Ubuntu laptop
+sudo ./scripts/setup_can_laptop.sh
+
+# Jetson Orin
+sudo ./scripts/setup_can_orin.sh
+```
+
+### Step 2 — launch the node
+
+```bash
+# Ubuntu laptop (defaults to can0)
 ros2 launch ak_motor_driver cable_control.launch.py
-```
 
-- launch cable control node (Jetson Orin):
-```bash
+# Jetson Orin (USB dongle is can1)
 ros2 launch ak_motor_driver cable_control.launch.py can_interface:=can1
-```
-
-- launch testing node:
-```bash
-ros2 launch ak_motor_driver ak_motor.launch.py
 ```
 
 ## Operating sequence
