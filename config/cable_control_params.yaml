@@ -1,0 +1,25 @@
+ak_motor_cable_control_node:
+  ros__parameters:
+    can_interface: "can0"
+    motor_id: 1
+    motor_name: "ak40_10"
+    poll_rate_hz: 100.0
+    # AK40-10 MIT-mode physical limits
+    p_min: -12.5   # rad
+    p_max:  12.5   # rad
+    v_min: -45.5   # rad/s
+    v_max:  45.5   # rad/s
+    t_min:  -5.0   # Nm
+    t_max:   5.0   # Nm
+    kp_max: 500.0  # Nm/rad
+    kd_max:   5.0  # Nms/rad
+    # Speed mode gain (kp is always 0 in speed mode)
+    kd_speed: 0.5   # Nms/rad
+    # Position mode gains
+    kp_pos: 1.0     # Nm/rad
+    kd_pos: 0.3     # Nms/rad
+    # Safety
+    command_timeout_ms: 500.0
+    kd_watchdog: 0.05
+    heartbeat_timeout_ms: 1000.0
+    temp_limit_c: 75.0

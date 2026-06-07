@@ -74,14 +74,19 @@ source install/setup.bash
 
 ## Launch
 
+- launch cable control node (laptop):
+```bash
+ros2 launch ak_motor_driver cable_control.launch.py
+```
+
+- launch cable control node (Jetson Orin):
+```bash
+ros2 launch ak_motor_driver cable_control.launch.py can_interface:=can1
+```
+
 - launch testing node:
 ```bash
 ros2 launch ak_motor_driver ak_motor.launch.py
-```
-
-- launch torque control node:
-```bash
-ros2 launch ak_motor_driver slung_load.launch.py
 ```
 
 ## Operating sequence
@@ -180,6 +185,69 @@ ros2 topic hz /ak_motor_node/joint_state
 | `p_min` / `p_max` | `-12.5` / `12.5` | Position limits (rad) |
 | `v_min` / `v_max` | `-45.5` / `45.5` | Velocity limits (rad/s) — AK40-10 spec |
 | `t_min` / `t_max` | `-5.0` / `5.0` | Torque limits (Nm) — AK40-10 spec |
+
+## Cable control node
+
+### Topics
+
+| Topic | Direction | Type | Purpose |
+|---|---|---|---|
+| `~/command` | GUI → node | `sensor_msgs/JointState` | Speed (velocity), torque (effort), or position setpoint |
+| `~/mode_cmd` | GUI → node | `std_msgs/String` | Switch mode: `"speed"`, `"torque"`, `"pos"` |
+| `~/heartbeat` | GUI → node | `std_msgs/Empty` | Primary GUI heartbeat |
+| `~/heartbeat_external` | backup → node | `std_msgs/Empty` | Backup heartbeat source |
+| `~/node_heartbeat` | node → GUI | `std_msgs/Empty` | Node liveness signal (100 Hz) |
+| `~/enabled` | node → GUI | `std_msgs/Bool` | Motor enable state |
+| `~/control_mode` | node → GUI | `std_msgs/String` | Current active mode |
+| `~/joint_state` | node → GUI | `sensor_msgs/JointState` | Motor feedback |
+| `~/temperature` | node → GUI | `std_msgs/Float32` | Motor temperature (°C) |
+| `~/mode` | node → GUI | `std_msgs/Int8` | Motor mode enum |
+| `~/error_flags` | node → GUI | `std_msgs/UInt8` | Raw error byte |
+
+### Gains
+
+Gains are loaded from the parameter file at startup and refreshed each time a mode switch is received on `~/mode_cmd`. The GUI never needs to call `ros2 param set`.
+
+| Mode | Active gains | Parameter |
+|---|---|---|
+| `speed` | `kp=0`, `kd=kd_speed` | `kd_speed` (default 0.5) |
+| `torque` | `kp=0`, `kd=0` | — |
+| `pos` | `kp=kp_pos`, `kd=kd_pos` | `kp_pos` (default 1.0), `kd_pos` (default 0.3) |
+
+If `~/command` contains non-zero fields that don't belong to the current mode, the node logs a `[WARN]` and ignores those fields.
+
+### Timeouts
+
+| Parameter | Default | Effect when exceeded |
+|---|---|---|
+| `command_timeout_ms` | 500 ms | Drops to `kp=0, kd=kd_watchdog` (pure damping) |
+| `heartbeat_timeout_ms` | 1000 ms | Disables motor if **both** heartbeat sources are stale |
+
+### Services
+
+```bash
+ros2 service call /ak_motor_cable_control_node/enable std_srvs/srv/Trigger
+ros2 service call /ak_motor_cable_control_node/disable std_srvs/srv/Trigger
+
+# Reset encoder zero position (motor must be disabled first)
+ros2 service call /ak_motor_cable_control_node/disable std_srvs/srv/Trigger
+ros2 service call /ak_motor_cable_control_node/zero_position std_srvs/srv/Trigger
+```
+
+### Switch control mode
+
+```bash
+ros2 topic pub --once /ak_motor_cable_control_node/mode_cmd std_msgs/msg/String "{data: 'speed'}"
+ros2 topic pub --once /ak_motor_cable_control_node/mode_cmd std_msgs/msg/String "{data: 'torque'}"
+ros2 topic pub --once /ak_motor_cable_control_node/mode_cmd std_msgs/msg/String "{data: 'pos'}"
+```
+
+### Send speed command (rad/s)
+
+```bash
+ros2 topic pub --rate 50 /ak_motor_cable_control_node/command sensor_msgs/msg/JointState \
+  "{name: ['ak40_10'], position: [0.0], velocity: [1.0], effort: [0.0]}"
+```
 
 ## Control modes
 

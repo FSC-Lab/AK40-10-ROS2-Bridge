@@ -1,4 +1,8 @@
-1. Desgin a seperate node such that it handles torque command.
-2. I need a watch dog such that if no ros2 message is sent over a given time, the torque is automatically set to 0;
-3. need a config file to set the positive direction. 
-4. the radius of the cable wheel is 2.5cm. The payload is 300g. 
+ak_motor_cable_control_node.
+1. I only need the speed and torque mode for the motor. Default parameter is kp = 0, kd = 0.5
+2. Like ak_motor_node, the cable coontrol node needs to receive the heartbeat message from the gui. 
+3. Add an additional heartbeat topic: heartbeat_external. this topic is severed as an alternative source of heartbeat to maintain the motor enabled.
+4. The node should has 3 modes: pos mode, speed mode and torque mode. (for now, lets just start with speed mode as the default mode) (for now, the speed mode is just to control the motor angular speed (rad/s))
+5. Create a topic to receive the message from gui to switch to different modes. (pos, speed, torque
+6. Create a topic to publish the current mode to the gui. (pos, speed, torque), the motor status just like the ak_motor_node. 
+7. add a heartbeat for the cable control node itself, which is published to the gui. This is to make sure the gui can monitor the status of the cable control node.
