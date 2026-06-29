@@ -258,6 +258,171 @@ ros2 topic pub --rate 50 /ak_motor_cable_control_node/command sensor_msgs/msg/Jo
   "{name: ['ak40_10'], position: [0.0], velocity: [1.0], effort: [0.0]}"
 ```
 
+### External mode
+
+External mode allows a separate ROS node to drive the motor with direct torque commands. The cable control node acts as the authority gate — only it can open and close external mode.
+
+**State machine:** `off → standby → running`
+
+| Topic / Service | Type | Direction | Purpose |
+|---|---|---|---|
+| `~/enable_external_mode` | `Trigger` | service | `off → standby`; zeros encoder; rejects if already active |
+| `~/ext_torque_enable` | `std_msgs/Bool` | sub | `true`: `standby → running`; `false`: `running → standby` (holds zero velocity) |
+| `~/ext_torque_cmd` | `std_msgs/Float32` (N.m) | sub | Torque command; ignored unless `running`; clamped to `[torque_limit_lower, torque_limit_upper]` |
+| `~/ext_mode_cmd` | `std_msgs/String` | sub | `"off"`: exit external mode, restore previous control mode |
+| `~/ext_mode_state` | `std_msgs/String` | pub | Publishes `"off"` / `"standby"` / `"running"` at 100 Hz |
+| `~/cable_state` | `std_msgs/Float32MultiArray` | pub | `data[0]` = cable length (m), `data[1]` = cable velocity (m/s); active in any mode |
+
+**Manual activation sequence:**
+
+```bash
+# 1. Enable external mode (zeros encoder, enters STANDBY)
+ros2 service call /ak_motor_cable_control_node/enable_external_mode std_srvs/srv/Trigger
+
+# 2. Confirm STANDBY
+ros2 topic echo /ak_motor_cable_control_node/ext_mode_state --once
+
+# 3. Start torque control (STANDBY → RUNNING)
+ros2 topic pub --once /ak_motor_cable_control_node/ext_torque_enable std_msgs/msg/Bool "{data: true}"
+
+# 4. Send a torque command (N.m, clamped to ±1.5 N.m)
+ros2 topic pub --rate 100 /ak_motor_cable_control_node/ext_torque_cmd std_msgs/msg/Float32 "{data: 0.5}"
+
+# 5. Return to STANDBY (holds zero velocity)
+ros2 topic pub --once /ak_motor_cable_control_node/ext_torque_enable std_msgs/msg/Bool "{data: false}"
+
+# 6. Fully exit external mode
+ros2 topic pub --once /ak_motor_cable_control_node/ext_mode_cmd std_msgs/msg/String "{data: 'off'}"
+```
+
+**Sign convention (positive motor velocity = retract):**
+- Positive torque → retracts cable (payload up)
+- Negative torque → extends cable (payload down)
+- Gravity compensation requires positive torque: `τ = m × r × g`
+
+**New parameters (cable control node):**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `torque_limit_upper` | `1.5` N.m | External torque clamp upper bound (AK40-10 peak: 1.9 N.m) |
+| `torque_limit_lower` | `-1.5` N.m | External torque clamp lower bound |
+| `drum_radius` | `0.0175` m | Cable drum radius for length calculation |
+
+## Cable torque controller node
+
+`cable_torque_ctrl_node` is a test and calibration node that drives the cable control node via external mode using a model-based torque control law:
+
+```
+e_v  = v_c - v_c_star
+e_p  = p_c - p_c_star
+tau  = sat( mass × drum_radius × (acc_ref - kd_c × (e_v + kp_c × e_p)),
+            sat_upper, sat_lower )
+```
+
+Where `v_c` and `p_c` are the actual cable velocity and length read from the cable control node.
+
+**Default when no reference is received:** `acc_ref = 9.81 m/s²`, `v_c_star = 0`, `e_p = 0` — gravity hold (keeps a hanging payload stationary).
+
+### Topics
+
+| Topic | Type | Direction | Purpose |
+|---|---|---|---|
+| `~/reference` | `std_msgs/Float64MultiArray` [acc_ref, v_c_star, p_c_star] | sub | Combined reference input |
+| `~/cable_state` | `std_msgs/Float32MultiArray` [length, velocity] | sub | Cable length (m) and velocity (m/s) — remap to cable control node |
+| `~/ext_torque_cmd` | `std_msgs/Float32` | pub | Computed torque — remap to cable control node |
+| `~/ext_torque_enable` | `std_msgs/Bool` | pub | Arm/disarm signal — remap to cable control node |
+| `~/debug` | `std_msgs/Float64MultiArray` [tau, e_v, e_p, v_c, p_c, acc_ref] | pub | Live control variables |
+
+### Services
+
+| Service | Purpose |
+|---|---|
+| `~/arm` | Publishes `ext_torque_enable=true` (STANDBY → RUNNING); GUI must have already called `enable_external_mode` |
+| `~/disarm` | Publishes `ext_torque_enable=false` (RUNNING → STANDBY); GUI retains authority over the outer gate |
+
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `drum_radius` | `0.0175` m | Must match cable control node |
+| `mass` | `0.3` kg | Payload mass (default 300 g) |
+| `kp_c` | `1.0` 1/m | Cable position error gain |
+| `kd_c` | `0.5` s/m | Cable velocity error gain |
+| `sat_upper` | `1.5` N.m | Torque saturation upper bound |
+| `sat_lower` | `-1.5` N.m | Torque saturation lower bound |
+| `poll_rate_hz` | `100.0` Hz | Control loop rate |
+| `reference_timeout_ms` | `500.0` ms | Fall back to gravity hold if reference goes stale |
+
+### How to run
+
+**Terminal 1 — cable control node (already running):**
+
+```bash
+ros2 launch ak_motor_driver cable_control.launch.py
+```
+
+**Terminal 2 — torque controller node:**
+
+```bash
+# Default — connects to ak_motor_cable_control_node
+ros2 launch ak_motor_driver cable_torque_ctrl.launch.py
+
+# Custom cable control node name
+ros2 launch ak_motor_driver cable_torque_ctrl.launch.py cable_ctrl_node:=my_cable_node
+```
+
+All topic remapping to the cable control node is handled inside the launch file.
+
+**Terminal 3 — enable the motor (GUI or CLI):**
+
+```bash
+ros2 service call /ak_motor_cable_control_node/enable std_srvs/srv/Trigger
+```
+
+**Terminal 4 — GUI opens external mode (outer gate: OFF → STANDBY):**
+
+The GUI calls `enable_external_mode`. Confirm STANDBY:
+```bash
+ros2 topic echo /ak_motor_cable_control_node/ext_mode_state --once
+# expected: data: standby
+```
+
+**Terminal 5 — arm the torque controller (inner gate: STANDBY → RUNNING):**
+
+```bash
+ros2 service call /cable_torque_ctrl_node/arm std_srvs/srv/Trigger
+```
+
+Without a `~/reference` message the node outputs gravity hold: `tau = mass × drum_radius × g ≈ 0.052 N·m` (with default params).
+
+**Check the controller is running:**
+
+```bash
+# Control mode should read "external"
+ros2 topic echo /ak_motor_cable_control_node/control_mode --once
+
+# Watch live control variables: [tau, e_v, e_p, v_c, p_c, acc_ref]
+ros2 topic echo /cable_torque_ctrl_node/debug
+```
+
+**Send a reference** (acc_ref m/s², v_c_star m/s retract, p_c_star m retracted from zero):
+
+```bash
+# Gravity hold only (same as default)
+ros2 topic pub --rate 50 /cable_torque_ctrl_node/reference \
+  std_msgs/msg/Float64MultiArray "{data: [9.81, 0.0, 0.0]}"
+```
+
+> **Sign convention for `~/reference`:** `v_c_star` and `p_c_star` use the retraction convention — positive = more retracted/retracting — opposite to `~/cable_state` which uses cable-length convention (decreases when retracting).
+
+**Disarm (inner gate: RUNNING → STANDBY):**
+
+```bash
+ros2 service call /cable_torque_ctrl_node/disarm std_srvs/srv/Trigger
+```
+
+**GUI then closes external mode (outer gate: STANDBY → OFF) via `ext_mode_cmd="off"`.**
+
 ## Control modes
 
 The MIT protocol computes output torque as:

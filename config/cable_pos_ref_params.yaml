@@ -1,0 +1,4 @@
+cable_pos_ref_node:
+  ros__parameters:
+    pos_setpoint: 0.05   # m (retraction convention: positive = more retracted)
+    poll_rate_hz: 100.0

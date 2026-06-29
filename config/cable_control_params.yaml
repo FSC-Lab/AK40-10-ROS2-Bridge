@@ -23,3 +23,8 @@ ak_motor_cable_control_node:
     kd_watchdog: 0.05
     heartbeat_timeout_ms: 1500.0
     temp_limit_c: 75.0
+    # External mode torque clamp
+    torque_limit_upper:  1.5    # N.m  (AK40-10 peak: 1.9 N.m)
+    torque_limit_lower: -1.5    # N.m
+    # Cable drum geometry
+    drum_radius: 0.0175          # m (17.5 mm)

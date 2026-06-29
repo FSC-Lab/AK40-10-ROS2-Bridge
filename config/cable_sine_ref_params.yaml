@@ -1,0 +1,5 @@
+cable_sine_ref_node:
+  ros__parameters:
+    freq_hz:      0.5    # oscillation frequency (Hz)
+    amplitude:    0.1    # peak displacement (m), retraction convention: positive = retract
+    poll_rate_hz: 100.0

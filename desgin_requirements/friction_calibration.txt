@@ -1,0 +1,13 @@
+1. Create a node to enable various pos and posiiton command
+2. the node need parameter drum radius and weight of the object (default 300g)
+3. the node subscribes to external acc_ref, cable velocity and cable position reference state.
+4. the control law is:
+e_v = v_c - v_c_star; cable speed error
+e_p = p_c - p_c_star; cable pos error
+acc_ref: desired acceleration of the payload include gravity and friction compensation.
+
+sat(a, upper, lower) : saturation function
+
+t = sat(m * r * (acc_ref  - kd_c * (e_v + kp_c * e_p)), upper, lower)
+
+5. combine all reference in a single topic. if this topic does not send anything, set acc_ref = g, v_c_star =0, e_p = 0. (zero speed commnad)
