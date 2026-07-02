@@ -115,13 +115,15 @@ Ground station:   off  ◄── ext_mode_cmd="off"
 
 ## CableTorqueCtrlNode (`cable_torque_ctrl_node.cpp`)
 
-Standalone test and calibration node that drives `AkMotorCableControlNode` via external mode using a model-based torque control law:
+Standalone test and calibration node that drives `AkMotorCableControlNode` via external mode using a model-based torque control law with friction compensation and UDE:
 
 ```
-e_v  = v_c  - v_c_star
-e_p  = p_c  - p_c_star
-tau  = sat( mass × drum_radius × (acc_ref − kd_c × (e_v + kp_c × e_p)),
-            sat_upper, sat_lower )
+e_v        = v_c  - v_c_star
+e_p        = p_c  - p_c_star
+tau_ctrl   = mass × drum_radius × (acc_ref − kd_c × (e_v + kp_c × e_p))
+tau_fric   = coulomb × tanh(ω/ε) + b × ω                (friction feedforward)
+tau_d_hat  = UDE estimate (see below)
+tau        = sat(tau_ctrl + tau_fric + tau_d_hat, sat_upper, sat_lower)
 ```
 
 Default when `~/reference` is not received: `acc_ref = 9.81 m/s²`, `v_c_star = 0`, `e_p = 0` — gravity hold.
@@ -129,14 +131,24 @@ Default when `~/reference` is not received: `acc_ref = 9.81 m/s²`, `v_c_star = 
 **Topic wiring:** `~/cable_state`, all `~/ext_*` topics, and `~/enable_external_mode` are remapped to `AkMotorCableControlNode` in `launch/cable_torque_ctrl.launch.py`. The `cable_ctrl_node` launch argument (default `ak_motor_cable_control_node`) controls the target node name. `~/cable_state` replaces the former pair of `~/cable_length` + `~/joint_state` subscriptions.
 
 **Arm/disarm services:**
-- `~/arm` — calls `enable_external_mode` asynchronously via the service client, then publishes `ext_torque_enable=true`. Sets `armed_=true` in the async response callback only if the service succeeds.
-- `~/disarm` — publishes `ext_torque_enable=false` and `ext_mode_cmd="off"`, clears `armed_`.
+- `~/arm` — publishes `ext_torque_enable=true` (STANDBY → RUNNING); GUI must have already called `enable_external_mode`.
+- `~/disarm` — publishes `ext_torque_enable=false`, resets UDE state, clears `armed_`.
 
 **Motor direction:** if positive torque extends instead of retracts, set `motor_direction: -1` in `config/cable_torque_ctrl_params.yaml`. This parameter multiplies `v_c`, `p_c` (on receipt), and the output `tau` — all three must be flipped together or the controller fights itself.
 
-**Reference topic:** `~/reference` (`Float64MultiArray`, 3 elements): `[acc_ref (m/s²), v_c_star (m/s), p_c_star (m)]`. Goes stale after `reference_timeout_ms` (default 500 ms), falling back to gravity hold with a throttled `[WARN]`.
+**Reference topic:** `~/reference` (`Float64MultiArray`, 3 elements): `[acc_ref (m/s²), v_c_star (m/s), p_c_star (m)]`. `v_c_star` and `p_c_star` use **cable_state convention** (positive = extended/extending) — the same sign as `~/cable_state` and the GUI, so the number you send matches what the GUI displays. `acc_ref` is in the retraction frame (`g` for gravity hold). Goes stale after `reference_timeout_ms` (default 500 ms), falling back to gravity hold with a throttled `[WARN]`.
 
-**Debug topic:** `~/debug` (`Float64MultiArray`): `[tau, e_v, e_p, v_c, p_c, acc_ref]` — publishes the post-saturation torque and all intermediate control variables every poll cycle.
+**UDE (Uncertainty and Disturbance Estimator):** compensates unknown residual disturbance `tau_d` in gear/cable dynamics. Motor model: `J·dω/dt + b·ω = tau_m + tau_d + tau_static`. Integral update law (avoids differentiating ω):
+```
+integrand       = tau_d_hat − b·ω + tau_m + tau_static   (viscous terms cancel analytically)
+integral_term  += integrand × dt        (frozen at ±ude_integral_limit for anti-windup)
+tau_d_hat       = λ × J × ω − λ × integral_term
+```
+State is reset to zero on `~/disarm`. Parameters: `ude_lambda` (bandwidth, default 10 rad/s), `ude_inertia` (J, default 0.001 kg·m²), `ude_integral_limit` (±0.04 N·m).
+
+**Debug topic:** `~/debug` (`Float64MultiArray`): `[tau, e_v, e_p, v_c, p_c, acc_ref, tau_friction, tau_d_hat]` — publishes the post-saturation torque, all intermediate control variables, friction feedforward, and UDE estimate every poll cycle.
+
+**UDE disturbance topic:** `~/ude_disturbance` (`Float64`): `tau_d_hat` in N·m — published every poll cycle for GUI monitoring.
 
 ## Platform differences
 

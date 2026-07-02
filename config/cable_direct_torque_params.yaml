@@ -1,0 +1,6 @@
+cable_direct_torque_node:
+  ros__parameters:
+    torque_limit_upper:  1.0    # N.m  cap for safety during no-load test
+    torque_limit_lower: -1.0    # N.m
+    command_timeout_ms:  500.0  # ms   output zeroed if ~/torque_cmd goes stale
+    poll_rate_hz:        100.0

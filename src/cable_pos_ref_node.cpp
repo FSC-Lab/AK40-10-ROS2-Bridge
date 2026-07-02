@@ -11,7 +11,7 @@ static constexpr double kGravity = 9.81;
 // Publishes a constant position setpoint to ~/reference for CableTorqueCtrlNode.
 //   acc_ref  = g      (gravity hold)
 //   v_c_star = 0.0    (zero velocity)
-//   p_c_star = pos_setpoint (m, retraction convention: positive = more retracted)
+//   p_c_star = pos_setpoint (m, cable_state convention: positive = extended, matches GUI)
 
 class CablePosRefNode : public rclcpp::Node {
  public:

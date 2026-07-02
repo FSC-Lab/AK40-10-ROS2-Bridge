@@ -310,18 +310,38 @@ ros2 topic pub --once /ak_motor_cable_control_node/ext_mode_cmd std_msgs/msg/Str
 
 ## Cable torque controller node
 
-`cable_torque_ctrl_node` is a test and calibration node that drives the cable control node via external mode using a model-based torque control law:
+`cable_torque_ctrl_node` is a test and calibration node that drives the cable control node via external mode using a model-based torque control law with friction compensation and UDE:
 
 ```
-e_v  = v_c - v_c_star
-e_p  = p_c - p_c_star
-tau  = sat( mass × drum_radius × (acc_ref - kd_c × (e_v + kp_c × e_p)),
-            sat_upper, sat_lower )
+e_v       = v_c - v_c_star
+e_p       = p_c - p_c_star
+tau_ctrl  = mass × drum_radius × (acc_ref - kd_c × (e_v + kp_c × e_p))
+tau_fric  = coulomb × tanh(ω/ε) + b × ω                (friction feedforward)
+tau_d_hat = UDE disturbance estimate                     (see UDE section below)
+tau       = sat(tau_ctrl + tau_fric + tau_d_hat, sat_upper, sat_lower)
 ```
 
 Where `v_c` and `p_c` are the actual cable velocity and length read from the cable control node.
 
 **Default when no reference is received:** `acc_ref = 9.81 m/s²`, `v_c_star = 0`, `e_p = 0` — gravity hold (keeps a hanging payload stationary).
+
+### UDE (Uncertainty and Disturbance Estimator)
+
+Estimates unknown residual disturbance `tau_d` in gear/cable dynamics. Motor model:
+
+```
+J·dω/dt + b·ω = tau_m + tau_d + tau_static
+```
+
+Integral update (avoids computing dω/dt; viscous terms cancel analytically):
+
+```
+integrand      = tau_d_hat − b·ω + tau_m + tau_static
+integral_term += integrand × dt     (frozen at ±ude_integral_limit — anti-windup)
+tau_d_hat      = λ × J × ω − λ × integral_term
+```
+
+UDE state is reset to zero on `~/disarm`. Monitor via `~/ude_disturbance`.
 
 ### Topics
 
@@ -331,25 +351,32 @@ Where `v_c` and `p_c` are the actual cable velocity and length read from the cab
 | `~/cable_state` | `std_msgs/Float32MultiArray` [length, velocity] | sub | Cable length (m) and velocity (m/s) — remap to cable control node |
 | `~/ext_torque_cmd` | `std_msgs/Float32` | pub | Computed torque — remap to cable control node |
 | `~/ext_torque_enable` | `std_msgs/Bool` | pub | Arm/disarm signal — remap to cable control node |
-| `~/debug` | `std_msgs/Float64MultiArray` [tau, e_v, e_p, v_c, p_c, acc_ref] | pub | Live control variables |
+| `~/debug` | `std_msgs/Float64MultiArray` [tau, e_v, e_p, v_c, p_c, acc_ref, tau_friction, tau_d_hat] | pub | Live control variables |
+| `~/ude_disturbance` | `std_msgs/Float64` | pub | UDE estimated disturbance `tau_d_hat` (N·m) |
 
 ### Services
 
 | Service | Purpose |
 |---|---|
 | `~/arm` | Publishes `ext_torque_enable=true` (STANDBY → RUNNING); GUI must have already called `enable_external_mode` |
-| `~/disarm` | Publishes `ext_torque_enable=false` (RUNNING → STANDBY); GUI retains authority over the outer gate |
+| `~/disarm` | Publishes `ext_torque_enable=false`, resets UDE state (RUNNING → STANDBY) |
 
 ### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
 | `drum_radius` | `0.0175` m | Must match cable control node |
-| `mass` | `0.3` kg | Payload mass (default 300 g) |
+| `mass` | `0.3` kg | Payload mass |
 | `kp_c` | `1.0` 1/m | Cable position error gain |
 | `kd_c` | `0.5` s/m | Cable velocity error gain |
 | `sat_upper` | `1.5` N.m | Torque saturation upper bound |
 | `sat_lower` | `-1.5` N.m | Torque saturation lower bound |
+| `coulomb_friction` | `0.0203` N.m | Coulomb friction (from calibration) |
+| `viscous_drag` | `0.00140` N.m·s/rad | Viscous drag coefficient b (from calibration) |
+| `friction_velocity_deadband` | `0.5` rad/s | tanh smoothing window near zero velocity |
+| `ude_lambda` | `10.0` rad/s | UDE bandwidth — higher = faster estimation, more noise |
+| `ude_inertia` | `0.001` kg·m² | Motor moment of inertia J |
+| `ude_integral_limit` | `0.04` N·m | Anti-windup clamp on UDE integral term (±limit) |
 | `poll_rate_hz` | `100.0` Hz | Control loop rate |
 | `reference_timeout_ms` | `500.0` ms | Fall back to gravity hold if reference goes stale |
 
@@ -401,19 +428,51 @@ Without a `~/reference` message the node outputs gravity hold: `tau = mass × dr
 # Control mode should read "external"
 ros2 topic echo /ak_motor_cable_control_node/control_mode --once
 
-# Watch live control variables: [tau, e_v, e_p, v_c, p_c, acc_ref]
+# Watch live control variables: [tau, e_v, e_p, v_c, p_c, acc_ref, tau_friction, tau_d_hat]
 ros2 topic echo /cable_torque_ctrl_node/debug
+
+# Watch UDE disturbance estimate
+ros2 topic echo /cable_torque_ctrl_node/ude_disturbance
 ```
 
-**Send a reference** (acc_ref m/s², v_c_star m/s retract, p_c_star m retracted from zero):
+**Send a reference** (acc_ref m/s², v_c_star m/s, p_c_star m — same sign as GUI `~/cable_state`):
 
 ```bash
-# Gravity hold only (same as default)
-ros2 topic pub --rate 50 /cable_torque_ctrl_node/reference \
+# Position hold at zero
+ros2 topic pub -r 50 /cable_torque_ctrl_node/reference \
   std_msgs/msg/Float64MultiArray "{data: [9.81, 0.0, 0.0]}"
+
+# Hold 5 cm extended (cable longer, payload lower) — positive matches GUI
+ros2 topic pub -r 50 /cable_torque_ctrl_node/reference \
+  std_msgs/msg/Float64MultiArray "{data: [9.81, 0.0, 0.05]}"
+
+# Hold 5 cm retracted (cable shorter, payload higher) — negative matches GUI
+ros2 topic pub -r 50 /cable_torque_ctrl_node/reference \
+  std_msgs/msg/Float64MultiArray "{data: [9.81, 0.0, -0.05]}"
 ```
 
-> **Sign convention for `~/reference`:** `v_c_star` and `p_c_star` use the retraction convention — positive = more retracted/retracting — opposite to `~/cable_state` which uses cable-length convention (decreases when retracting).
+> **Sign convention for `~/reference`:** `v_c_star` and `p_c_star` use the **same** sign as `~/cable_state` (cable-length convention: positive = extended/extending). The number you send matches what the GUI displays. The node converts to the internal retraction convention internally.
+
+**Waveform reference nodes** (launch in a separate terminal while the torque controller is running and armed):
+
+| Node | Launch file | Config file | Trajectory |
+|---|---|---|---|
+| Sinusoidal | `cable_sine_ref.launch.py` | `config/cable_sine_ref_params.yaml` | `p = A·sin(2πft)`, with velocity + acc feedforward |
+| Square wave | `cable_square_ref.launch.py` | `config/cable_square_ref_params.yaml` | `p = ±A` toggled at `f` Hz, adjustable duty cycle |
+| Triangular | `cable_triangle_ref.launch.py` | `config/cable_triangle_ref_params.yaml` | `p` ramps linearly ±A each half period, velocity feedforward |
+
+```bash
+# Sine wave (default: 0.5 Hz, ±0.1 m)
+ros2 launch ak_motor_driver cable_sine_ref.launch.py
+
+# Square wave (default: 0.2 Hz, ±0.15 m, 50% duty)
+ros2 launch ak_motor_driver cable_square_ref.launch.py
+
+# Triangular wave (default: 0.3 Hz, ±0.15 m)
+ros2 launch ak_motor_driver cable_triangle_ref.launch.py
+```
+
+Edit the corresponding config file to change frequency, amplitude, or duty cycle before launching. Both nodes remap `~/reference` to `/cable_torque_ctrl_node/reference` automatically.
 
 **Disarm (inner gate: RUNNING → STANDBY):**
 

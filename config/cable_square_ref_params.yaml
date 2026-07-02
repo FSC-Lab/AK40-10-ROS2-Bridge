@@ -1,0 +1,6 @@
+cable_square_ref_node:
+  ros__parameters:
+    freq_hz:      0.2    # Hz
+    amplitude:    0.15   # m (half peak-to-peak, cable_state convention: positive = extended)
+    duty_cycle:   0.5    # fraction of period at +amplitude (0–1)
+    poll_rate_hz: 100.0

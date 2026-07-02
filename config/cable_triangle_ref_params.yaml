@@ -1,0 +1,5 @@
+cable_triangle_ref_node:
+  ros__parameters:
+    freq_hz:      0.3    # Hz
+    amplitude:    0.15   # m (half peak-to-peak, cable_state convention: positive = extended)
+    poll_rate_hz: 100.0

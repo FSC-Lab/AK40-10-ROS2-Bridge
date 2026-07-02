@@ -58,15 +58,30 @@ add_executable(cable_sine_ref_node src/cable_sine_ref_node.cpp)
 target_compile_features(cable_sine_ref_node PRIVATE cxx_std_17)
 ament_target_dependencies(cable_sine_ref_node ${_deps})
 
+# ── Square-wave position reference ────────────────────────────────────────────
+add_executable(cable_square_ref_node src/cable_square_ref_node.cpp)
+target_compile_features(cable_square_ref_node PRIVATE cxx_std_17)
+ament_target_dependencies(cable_square_ref_node ${_deps})
+
+# ── Triangular-wave position reference ───────────────────────────────────────
+add_executable(cable_triangle_ref_node src/cable_triangle_ref_node.cpp)
+target_compile_features(cable_triangle_ref_node PRIVATE cxx_std_17)
+ament_target_dependencies(cable_triangle_ref_node ${_deps})
+
 # ── Constant position setpoint reference ─────────────────────────────────────
 add_executable(cable_pos_ref_node src/cable_pos_ref_node.cpp)
 target_compile_features(cable_pos_ref_node PRIVATE cxx_std_17)
 ament_target_dependencies(cable_pos_ref_node ${_deps})
 
+# ── Direct torque passthrough (friction/drag identification) ──────────────────
+add_executable(cable_direct_torque_node src/cable_direct_torque_node.cpp)
+target_compile_features(cable_direct_torque_node PRIVATE cxx_std_17)
+ament_target_dependencies(cable_direct_torque_node ${_deps})
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS can_socket ak40_codec ak_motor_node slung_load_node
   ak_motor_cable_control_node cable_torque_ctrl_node cable_sine_ref_node
-  cable_pos_ref_node
+  cable_square_ref_node cable_triangle_ref_node cable_pos_ref_node cable_direct_torque_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME})

@@ -11,3 +11,27 @@ ak_motor_cable_control_node.
 10. The cable control node should have a safety feature: uppper and lower bound of the maximum torque command. If the torque command exceeds the bounds. The output torque is capped to the bounds. Add the limit to the parameter files. 
 11. The temperature of the motor should be monitored. If the temperature exceeds a threshold, external mode should be disabled. The node fallback to velocity with zero velocity command.
 12. When the external mode is enabled, automatically reset encoders to zero. This is to ensure that the motor starts from a known position when switching to external mode.
+13. The uncertainty and disturbance estimator (UDE). To compensate for the unknow disturbance in the gears. (simplifed version with no additional friction compensation)
+Suppose the motor dynamics is:
+J * d omega/dt = tau_p + tau_d + tau. 
+where tau_d is the unknown disturbance torque. tau_p is the torque by the payload. tau is the motor torque (final, capped). The estimated disturbance is tau_d_hat, the estimation error is tau_d_tilde = tau_d_hat - tau_d. The UDE update law is:
+tau_d_hat_dot = - lambda * tau_d_tilde
+
+The UDE update law is:
+d tau_d = - lambda (tau_d_hat - tau_d)
+ = - lambda (tau_d_hat - J * d omega/dt + tau_p + tau)
+
+The integral form of the UDE update law is:
+tau_d_hat = - lambda * integral(tau_d_hat - J * d omega/dt  + tau_p + tau)
+= lambda * J * omega - lambda * integral(tau_d_hat + tau_p + tau)
+
+integrand = tau_d_hat + tau_p + tau
+integral_term += integrand * dt
+
+tau_d_hat = lambda_ * J * omega - lambda_ * integral_term
+
+In addition, a saturation must be put on integral_term, with -0.06 to 0.06 Nm (in parameter file) If the integral reaches the saturation limit, the integral term will not be updated. The integral term will be reset to zero when the external mode is disabled.
+
+If the J is unknown, we can use: 0.001 as the default value.
+
+Add a topic to publish the estimated disturbance torque tau_d_hat to the gui. The gui can use this topic to monitor the estimated disturbance torque.
