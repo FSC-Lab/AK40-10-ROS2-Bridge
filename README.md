@@ -310,15 +310,14 @@ ros2 topic pub --once /ak_motor_cable_control_node/ext_mode_cmd std_msgs/msg/Str
 
 ## Cable torque controller node
 
-`cable_torque_ctrl_node` is a test and calibration node that drives the cable control node via external mode using a model-based torque control law with friction compensation and UDE:
+`cable_torque_ctrl_node` is a test and calibration node that drives the cable control node via external mode using a model-based torque control law with UDE disturbance compensation:
 
 ```
 e_v       = v_c - v_c_star
 e_p       = p_c - p_c_star
 tau_ctrl  = mass × drum_radius × (acc_ref - kd_c × (e_v + kp_c × e_p))
-tau_fric  = coulomb × tanh(ω/ε) + b × ω                (friction feedforward)
 tau_d_hat = UDE disturbance estimate                     (see UDE section below)
-tau       = sat(tau_ctrl + tau_fric + tau_d_hat, sat_upper, sat_lower)
+tau       = sat(tau_ctrl - tau_d_hat, sat_upper, sat_lower)
 ```
 
 Where `v_c` and `p_c` are the actual cable velocity and length read from the cable control node.
@@ -330,18 +329,20 @@ Where `v_c` and `p_c` are the actual cable velocity and length read from the cab
 Estimates unknown residual disturbance `tau_d` in gear/cable dynamics. Motor model:
 
 ```
-J·dω/dt + b·ω = tau_m + tau_d + tau_static
+J·dω/dt = tau_p + tau_d + tau
 ```
 
-Integral update (avoids computing dω/dt; viscous terms cancel analytically):
+Where `tau_p = −mass × drum_radius × g` (known payload gravity torque, negative = extension direction) and `tau` is the final capped motor torque from the previous step.
+
+Integral update (avoids computing dω/dt):
 
 ```
-integrand      = tau_d_hat − b·ω + tau_m + tau_static
-integral_term += integrand × dt     (frozen at ±ude_integral_limit — anti-windup)
+integrand      = tau_d_hat + tau_p + tau_applied_prev
+integral_term += integrand × dt     (frozen when |λ × integral_term| > ude_integral_limit)
 tau_d_hat      = λ × J × ω − λ × integral_term
 ```
 
-UDE state is reset to zero on `~/disarm`. Monitor via `~/ude_disturbance`.
+At steady state with zero position error, `tau_p + tau_ctrl = 0` so the integrand settles to zero naturally — no steady-state position error. UDE state is reset to zero on `~/disarm`. Monitor via `~/ude_disturbance`.
 
 ### Topics
 
@@ -351,7 +352,7 @@ UDE state is reset to zero on `~/disarm`. Monitor via `~/ude_disturbance`.
 | `~/cable_state` | `std_msgs/Float32MultiArray` [length, velocity] | sub | Cable length (m) and velocity (m/s) — remap to cable control node |
 | `~/ext_torque_cmd` | `std_msgs/Float32` | pub | Computed torque — remap to cable control node |
 | `~/ext_torque_enable` | `std_msgs/Bool` | pub | Arm/disarm signal — remap to cable control node |
-| `~/debug` | `std_msgs/Float64MultiArray` [tau, e_v, e_p, v_c, p_c, acc_ref, tau_friction, tau_d_hat] | pub | Live control variables |
+| `~/debug` | `std_msgs/Float64MultiArray` [tau, e_v, e_p, v_c, p_c, acc_ref, 0.0, tau_d_hat] | pub | Live control variables (index 6 unused/reserved) |
 | `~/ude_disturbance` | `std_msgs/Float64` | pub | UDE estimated disturbance `tau_d_hat` (N·m) |
 
 ### Services
@@ -366,17 +367,14 @@ UDE state is reset to zero on `~/disarm`. Monitor via `~/ude_disturbance`.
 | Parameter | Default | Description |
 |---|---|---|
 | `drum_radius` | `0.0175` m | Must match cable control node |
-| `mass` | `0.3` kg | Payload mass |
-| `kp_c` | `1.0` 1/m | Cable position error gain |
-| `kd_c` | `0.5` s/m | Cable velocity error gain |
+| `mass` | `0.565` kg | Payload mass |
+| `kp_c` | `8.0` 1/m | Cable position error gain |
+| `kd_c` | `20.0` s/m | Cable velocity error gain |
 | `sat_upper` | `1.5` N.m | Torque saturation upper bound |
 | `sat_lower` | `-1.5` N.m | Torque saturation lower bound |
-| `coulomb_friction` | `0.0203` N.m | Coulomb friction (from calibration) |
-| `viscous_drag` | `0.00140` N.m·s/rad | Viscous drag coefficient b (from calibration) |
-| `friction_velocity_deadband` | `0.5` rad/s | tanh smoothing window near zero velocity |
 | `ude_lambda` | `10.0` rad/s | UDE bandwidth — higher = faster estimation, more noise |
 | `ude_inertia` | `0.001` kg·m² | Motor moment of inertia J |
-| `ude_integral_limit` | `0.04` N·m | Anti-windup clamp on UDE integral term (±limit) |
+| `ude_integral_limit` | `0.06` N·m | Anti-windup clamp: frozen when `\|λ × integral_term\| > limit` |
 | `poll_rate_hz` | `100.0` Hz | Control loop rate |
 | `reference_timeout_ms` | `500.0` ms | Fall back to gravity hold if reference goes stale |
 
@@ -428,7 +426,7 @@ Without a `~/reference` message the node outputs gravity hold: `tau = mass × dr
 # Control mode should read "external"
 ros2 topic echo /ak_motor_cable_control_node/control_mode --once
 
-# Watch live control variables: [tau, e_v, e_p, v_c, p_c, acc_ref, tau_friction, tau_d_hat]
+# Watch live control variables: [tau, e_v, e_p, v_c, p_c, acc_ref, 0.0, tau_d_hat]
 ros2 topic echo /cable_torque_ctrl_node/debug
 
 # Watch UDE disturbance estimate
@@ -472,7 +470,27 @@ ros2 launch ak_motor_driver cable_square_ref.launch.py
 ros2 launch ak_motor_driver cable_triangle_ref.launch.py
 ```
 
-Edit the corresponding config file to change frequency, amplitude, or duty cycle before launching. Both nodes remap `~/reference` to `/cable_torque_ctrl_node/reference` automatically.
+Edit the corresponding config file to change frequency, amplitude, or duty cycle before launching. All nodes remap `~/reference` to `/cable_torque_ctrl_node/reference` automatically.
+
+**Record a calibration bag** (run in a separate terminal while the controller is armed):
+
+```bash
+ros2 bag record \
+  /ak_motor_cable_control_node/ext_torque_cmd \
+  /ak_motor_cable_control_node/cable_state \
+  /cable_torque_ctrl_node/ude_disturbance \
+  /cable_torque_ctrl_node/reference \
+  -o calibration_bag
+```
+
+| Topic | Type | Content |
+|---|---|---|
+| `ext_torque_cmd` | `Float32` | Commanded torque (N·m), positive = retract |
+| `cable_state` | `Float32MultiArray` | `[length_m, velocity_m_s]`, cable-state convention |
+| `ude_disturbance` | `Float64` | `tau_d_hat` (N·m) |
+| `reference` | `Float64MultiArray` | `[acc_ref, v_c_star, p_c_star]`, cable-state convention |
+
+Bags are saved to the current working directory as a folder named `calibration_bag/`. Use an absolute path (e.g. `-o ~/bags/calibration_bag`) to control the location.
 
 **Disarm (inner gate: RUNNING → STANDBY):**
 

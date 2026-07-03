@@ -115,15 +115,14 @@ Ground station:   off  ◄── ext_mode_cmd="off"
 
 ## CableTorqueCtrlNode (`cable_torque_ctrl_node.cpp`)
 
-Standalone test and calibration node that drives `AkMotorCableControlNode` via external mode using a model-based torque control law with friction compensation and UDE:
+Standalone test and calibration node that drives `AkMotorCableControlNode` via external mode using a model-based torque control law with UDE disturbance compensation:
 
 ```
 e_v        = v_c  - v_c_star
 e_p        = p_c  - p_c_star
 tau_ctrl   = mass × drum_radius × (acc_ref − kd_c × (e_v + kp_c × e_p))
-tau_fric   = coulomb × tanh(ω/ε) + b × ω                (friction feedforward)
 tau_d_hat  = UDE estimate (see below)
-tau        = sat(tau_ctrl + tau_fric + tau_d_hat, sat_upper, sat_lower)
+tau        = sat(tau_ctrl − tau_d_hat, sat_upper, sat_lower)
 ```
 
 Default when `~/reference` is not received: `acc_ref = 9.81 m/s²`, `v_c_star = 0`, `e_p = 0` — gravity hold.
@@ -138,17 +137,39 @@ Default when `~/reference` is not received: `acc_ref = 9.81 m/s²`, `v_c_star = 
 
 **Reference topic:** `~/reference` (`Float64MultiArray`, 3 elements): `[acc_ref (m/s²), v_c_star (m/s), p_c_star (m)]`. `v_c_star` and `p_c_star` use **cable_state convention** (positive = extended/extending) — the same sign as `~/cable_state` and the GUI, so the number you send matches what the GUI displays. `acc_ref` is in the retraction frame (`g` for gravity hold). Goes stale after `reference_timeout_ms` (default 500 ms), falling back to gravity hold with a throttled `[WARN]`.
 
-**UDE (Uncertainty and Disturbance Estimator):** compensates unknown residual disturbance `tau_d` in gear/cable dynamics. Motor model: `J·dω/dt + b·ω = tau_m + tau_d + tau_static`. Integral update law (avoids differentiating ω):
+**UDE (Uncertainty and Disturbance Estimator):** compensates unknown residual disturbance `tau_d` in gear/cable dynamics. Motor model: `J·dω/dt = tau_p + tau_d + tau`, where `tau_p = −mass × drum_radius × g` (known payload gravity torque) and `tau` is the final capped motor torque from the previous step. Integral update law (avoids differentiating ω):
 ```
-integrand       = tau_d_hat − b·ω + tau_m + tau_static   (viscous terms cancel analytically)
-integral_term  += integrand × dt        (frozen at ±ude_integral_limit for anti-windup)
-tau_d_hat       = λ × J × ω − λ × integral_term
+tau_p          = −mass × drum_radius × g     (≈ −0.097 N·m for default params)
+integrand      = tau_d_hat + tau_p + tau_applied_prev
+integral_term += integrand × dt        (frozen when |λ × integral_term| > ude_integral_limit)
+tau_d_hat      = λ × J × ω − λ × integral_term
 ```
-State is reset to zero on `~/disarm`. Parameters: `ude_lambda` (bandwidth, default 10 rad/s), `ude_inertia` (J, default 0.001 kg·m²), `ude_integral_limit` (±0.04 N·m).
+At steady state with zero position error, `tau_p + tau_ctrl = 0` so the integrand naturally settles to zero — no steady-state position error. State is reset to zero on `~/disarm`. Parameters: `ude_lambda` (bandwidth, default 10 rad/s), `ude_inertia` (J, default 0.001 kg·m²), `ude_integral_limit` (±0.06 N·m).
 
-**Debug topic:** `~/debug` (`Float64MultiArray`): `[tau, e_v, e_p, v_c, p_c, acc_ref, tau_friction, tau_d_hat]` — publishes the post-saturation torque, all intermediate control variables, friction feedforward, and UDE estimate every poll cycle.
+**Debug topic:** `~/debug` (`Float64MultiArray`): `[tau, e_v, e_p, v_c, p_c, acc_ref, 0.0, tau_d_hat]` — index 6 is unused/reserved. Publishes post-saturation torque, all intermediate control variables, and UDE estimate every poll cycle.
 
 **UDE disturbance topic:** `~/ude_disturbance` (`Float64`): `tau_d_hat` in N·m — published every poll cycle for GUI monitoring.
+
+**Waveform reference nodes** — publish to `~/reference` of `cable_torque_ctrl_node`, launched in a separate terminal while the controller is running and armed:
+
+| Node | Launch file | Config | Default |
+|---|---|---|---|
+| `cable_sine_ref_node` | `cable_sine_ref.launch.py` | `config/cable_sine_ref_params.yaml` | 0.5 Hz, ±0.1 m, velocity + acc feedforward |
+| `cable_square_ref_node` | `cable_square_ref.launch.py` | `config/cable_square_ref_params.yaml` | 0.2 Hz, ±0.15 m, 50% duty cycle |
+| `cable_triangle_ref_node` | `cable_triangle_ref.launch.py` | `config/cable_triangle_ref_params.yaml` | 0.3 Hz, ±0.15 m, velocity feedforward |
+| `cable_pos_ref_node` | — | — | Constant position hold at `pos_setpoint` |
+
+All waveform launch files remap `~/reference` → `/cable_torque_ctrl_node/reference` automatically.
+
+**Calibration rosbag:**
+```bash
+ros2 bag record \
+  /ak_motor_cable_control_node/ext_torque_cmd \
+  /ak_motor_cable_control_node/cable_state \
+  /cable_torque_ctrl_node/ude_disturbance \
+  /cable_torque_ctrl_node/reference \
+  -o calibration_bag
+```
 
 ## Platform differences
 

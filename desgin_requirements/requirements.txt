@@ -35,3 +35,19 @@ In addition, a saturation must be put on integral_term, with -0.06 to 0.06 Nm (i
 If the J is unknown, we can use: 0.001 as the default value.
 
 Add a topic to publish the estimated disturbance torque tau_d_hat to the gui. The gui can use this topic to monitor the estimated disturbance torque.
+
+14. Boundary sliding mode tracking controller. The tracking error is:
+ep = x - xd. 
+ev = v - vd.
+
+v = r * omega, where r is the radius of the pulley. The sliding surface is:
+s = ev + kp * ep
+
+The totoal moment of inertia of the system is J = J_shaft + m *r^2, where m is the mass of the payload.
+
+The dynamics of the system is:
+J * d v/dt = r * (tau_p + tau_d + tau)
+
+d v/dt = r/ J * tau_d + r/ J * tau_p + r/ J * tau
+
+control law is: tau = - r/ J * tau_p

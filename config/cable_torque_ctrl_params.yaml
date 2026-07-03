@@ -1,7 +1,7 @@
 cable_torque_ctrl_node:
   ros__parameters:
     # Cable drum geometry — must match cable_control_params.yaml
-    drum_radius: 0.0175        # m (17.5 mm)
+    drum_radius: 0.036         # m (36 mm)
     # Payload
     mass: 0.565                  # kg (565 g)
     # Control gains

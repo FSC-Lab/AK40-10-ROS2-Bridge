@@ -27,4 +27,4 @@ ak_motor_cable_control_node:
     torque_limit_upper:  1.5    # N.m  (AK40-10 peak: 1.9 N.m)
     torque_limit_lower: -1.5    # N.m
     # Cable drum geometry
-    drum_radius: 0.0175          # m (17.5 mm)
+    drum_radius: 0.036           # m (36 mm)
