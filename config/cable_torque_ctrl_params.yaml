@@ -1,33 +1,46 @@
 cable_torque_ctrl_node:
   ros__parameters:
-    # Cable drum geometry — must match cable_control_params.yaml
-    drum_radius: 0.036         # m (36 mm)
-    # Payload
-    mass: 0.565                  # kg (565 g)
-    # Control gains
-    # tau = sat(mass * drum_radius * (acc_ref - kd_c * (e_v + kp_c * e_p)), sat_upper, sat_lower)
-    kp_c: 5.0                  # 1/m   cable position error gain
-    kd_c: 20.0                  # s/m   cable velocity error gain
-    sat_upper:  1.5            # N.m   torque saturation upper bound
-    sat_lower: -1.5            # N.m   torque saturation lower bound
-    motor_direction: 1         # 1 or -1: set to -1 if positive torque extends instead of retracts
-    # Identified drivetrain parameters (from calibration bags: sine + square + triangle)
-    # Combined friction fit (UDE-based, R²=0.9795):  Fc=0.0559 N·m, Fv=-0.01001 N·m·s/rad (artifact)
-    # Direct regression fit (raw measurements, R²=0.880): J=0.000995 kg·m², Fc=0.0473 N·m, Fv=+0.00038 N·m·s/rad
-    # Use direct-regression Fv (positive, physically sensible); use combined-fit Fc (more samples, higher R²)
-    coulomb_friction:           0.0559    # N.m       (Coulomb/static friction, shaft-referenced)
-    viscous_drag:               0.00038   # N.m·s/rad (viscous damping, shaft-referenced; positive)
-    friction_velocity_deadband: 0.5       # rad/s     (tanh smoothing window near zero)
-    # UDE — Uncertainty and Disturbance Estimator
-    # Motor dynamics: J*dω/dt = tau_p + tau_d + tau
-    #   tau_p = -m*g*r  (known payload gravity torque; = -0.565*9.81*0.036 ≈ -0.199 N·m)
-    #   tau   = final capped motor torque
-    #   tau_d = unknown residual disturbance
-    # tau_d_hat = lambda*J*omega - lambda*integral(tau_d_hat + tau_p + tau)
-    # Derived: M_eff = J/r² = 0.000995/0.036² ≈ 0.768 kg
-    ude_lambda:         10.0    # rad/s  estimator bandwidth (higher = faster but more noise)
+    # ── Plant ──────────────────────────────────────────────────────────────
+    drum_radius: 0.036    # m  (36 mm); must match cable_control_params.yaml
+    mass:        0.565    # kg (565 g)
+
+    # ── BLSMC ──────────────────────────────────────────────────────────────
+    # s      = e_v + kp_c * e_p
+    # tau_eq = r*M_eff_hat*(a_dyn - kp_c*e_v) + m_hat*g*r + tau_f   (L1-adapted M_eff, m)
+    # tau_sw = -r*M_eff_hat*eta*sat(s/phi)
+    # tau    = sat(tau_eq + tau_sw, sat_lower, sat_upper)
+    kp_c:    5.0    # 1/m   sliding surface gain
+    smc_eta: 2.0    # m/s²  switching gain
+    smc_phi: 0.15   # m/s   boundary layer width (larger = less chattering)
+    sat_upper:  1.5  # N.m
+    sat_lower: -1.5  # N.m
+    motor_direction: 1  # 1 or -1: set to -1 if positive torque extends instead of retracts
+
+    # ── Friction feedforward ────────────────────────────────────────────────
+    # tau_f = Fc*tanh(omega/deadband) + Fv*omega   (shaft-referenced, N.m)
+    # From calibration (direct regression, 3 bags):
+    coulomb_friction:           0.0559   # N.m       (Coulomb; combined UDE fit R²=0.98)
+    viscous_drag:               0.00038  # N.m·s/rad (viscous; direct fit, positive/physical)
+    friction_velocity_deadband: 0.5      # rad/s     (tanh smoothing width near zero)
+
+    # ── L1 adaptive (§9, BLSMC_design.md) ─────────────────────────────────
+    # Estimates theta_1 = 1/(r*M_eff) and theta_2 = -mg/M_eff.
+    # Predictor uses (tau_prev - tau_f_prev) so friction is not absorbed into theta estimates.
+    # theta is initialized to nominal values from drum_radius, mass, ude_inertia at startup.
+    l1_as:          50.0   # state predictor gain (>> control bandwidth; discrete stable: |1-dt*as|<1)
+    l1_gamma_1:      5.0   # adaptation gain for theta_1 (control effectiveness)
+    l1_gamma_2:      5.0   # adaptation gain for theta_2 (gravity/mass term)
+    l1_omega_f:      5.0   # rad/s  low-pass filter bandwidth (time constant = 0.2 s)
+    l1_theta_1_min:  2.0   # projection lower bound on theta_1 (prevents M_eff > ~14 kg)
+
+    # ── UDE (monitor only — NOT injected into control) ─────────────────────
+    # tau_d_hat = lambda*J*omega - lambda*integral(tau_d_hat + tau_p + tau_applied_prev)
+    # tau_p = -m*g*r ≈ -0.199 N.m  (known payload gravity torque at shaft)
+    # When L1 has converged and friction ff is accurate, tau_d_hat should trend toward 0.
+    ude_lambda:         10.0      # rad/s  estimator bandwidth
     ude_inertia:        0.000995  # kg·m²  shaft moment of inertia J (from direct regression)
-    ude_integral_limit: 0.06    # N·m    anti-windup clamp on lambda*integral_term (±limit)
-    # Timing
-    poll_rate_hz: 100.0
-    reference_timeout_ms: 500.0  # fall back to gravity hold if reference goes stale
+    ude_integral_limit: 0.06      # N·m    anti-windup clamp on lambda*integral_term
+
+    # ── Timing ─────────────────────────────────────────────────────────────
+    poll_rate_hz:        100.0
+    reference_timeout_ms: 500.0

@@ -2,17 +2,39 @@
 
 ## 1. Plant Model (Rotor Shaft, Direct Drive — No Gearbox)
 
-Shaft dynamics:
+### 1.1 Shaft-only inertia (motor + drum, no payload reflection)
 
 $$J\ddot\theta = \tau + mgr + \tau_f(\dot\theta)$$
 
-- $J$ — total shaft inertia (motor rotor + spool), constant, no gear reduction
+- $J$ — shaft-only inertia (motor rotor + spool), constant, no gear reduction
 - $\tau$ — motor torque command (direct-drive)
 - $m$ — payload mass
 - $r$ — drum radius (fixed constant)
 - $\tau_f(\dot\theta)$ — friction/viscous torque (Coulomb + viscous, possibly Stribeck), identified from no-load tests
 
 **Sign convention:** $\theta$ increasing = payout direction, so gravity torque acts positively (`+mgr`). Flip sign if your convention has $\theta$ increasing = retrieval.
+
+### 1.2 Correction — payload inertia reflected through the drum
+
+The equation above only counts the shaft's own inertia. The payload's *translational* mass also reflects onto the shaft as an additional rotational inertia $mr^2$, distinct from (and in addition to) the $mgr$ gravity torque term. Derive via free-body diagrams:
+
+**Shaft**, with cable tension $T$ resisting motor torque:
+$$J\ddot\theta = \tau - Tr + \tau_f(\dot\theta)$$
+
+**Payload**, position $x = r\theta$ along the cable:
+$$m\ddot x = T - mg \;\;\Rightarrow\;\; T = mr\ddot\theta + mg$$
+
+Substituting $T$ into the shaft equation:
+
+$$J\ddot\theta = \tau - r(mr\ddot\theta + mg) + \tau_f \;\;\Rightarrow\;\; (J + mr^2)\ddot\theta = \tau - mgr + \tau_f$$
+
+**Total inertia** (used everywhere below in place of shaft-only $J$):
+
+$$\boxed{J_{total} = J + mr^2}$$
+
+Sanity check: if the drum/motor were massless ($J=0$), $M_{eff} = m$ — reduces to plain Newton's second law for a hanging mass, as expected.
+
+**Note on sign:** this free-body derivation gives $-mgr$ (gravity resists retrieval through cable tension) rather than $+mgr$ from §1.1 — reconcile this against your actual $\theta$/payout convention before implementation; the $J+mr^2$ inertia correction holds regardless of which sign convention you use for the gravity term.
 
 ## 2. Payload Position/Velocity from Drum Kinematics
 
@@ -22,7 +44,9 @@ $$x = r\theta, \qquad v = r\dot\theta = \dot x, \qquad a = r\ddot\theta = \ddot 
 
 ## 3. Payload-Referenced Dynamics
 
-Substituting $\ddot\theta = a/r$ into the shaft equation and defining effective payload-side mass $M_{eff} = J/r^2$:
+Substituting $\ddot\theta = a/r$ into the shaft equation and defining effective payload-side mass using **total** inertia (§1.2):
+
+$$M_{eff} = \frac{J_{total}}{r^2} = \frac{J}{r^2} + m$$
 
 $$M_{eff}\,a = \frac{\tau}{r} + mg + \frac{1}{r}\tau_f\!\left(\frac{v}{r}\right)$$
 
@@ -108,9 +132,9 @@ with unknown parameter vector and known regressor:
 
 $$\theta = \begin{bmatrix}\theta_1 \\ \theta_2 \\ \theta_3 \\ \theta_4\end{bmatrix} = \begin{bmatrix} \dfrac{1}{M_{eff}\,r} \\[4pt] \dfrac{mg}{M_{eff}} \\[4pt] \dfrac{\tau_c}{M_{eff}\,r} \\[4pt] \dfrac{b}{M_{eff}\,r^2} \end{bmatrix}, \qquad \phi(\tau,v) = \begin{bmatrix}\tau \\ 1 \\ \text{sign}(v/r) \\ v\end{bmatrix}$$
 
-$\theta_1$ is the **control effectiveness** (always positive, since $M_{eff}>0$); $\theta_2,\theta_3,\theta_4$ are additive-uncertainty-style parameters. Recovering physical parameters from estimates $\hat\theta$:
+$\theta_1$ is the **control effectiveness** (always positive, since $M_{eff}>0$); $\theta_2,\theta_3,\theta_4$ are additive-uncertainty-style parameters. Recall $M_{eff} = J/r^2 + m$ (§1.2/§3) — $m$ appears in *both* $M_{eff}$ and the gravity term, so $J$ and $m$ are not independently identifiable from $\theta_1$ alone; recovering them needs both $\theta_1$ and $\theta_2$ jointly:
 
-$$\hat M_{eff} = \frac{1}{\hat\theta_1 r}, \qquad \hat m = \frac{\hat\theta_2\hat M_{eff}}{g}, \qquad \hat\tau_c = \hat\theta_3\hat M_{eff}\,r, \qquad \hat b = \hat\theta_4\hat M_{eff}\,r^2$$
+$$\hat M_{eff} = \frac{1}{\hat\theta_1 r}, \qquad \hat m = \frac{\hat\theta_2\hat M_{eff}}{g} = \frac{\hat\theta_2}{\hat\theta_1 rg}, \qquad \hat J = (\hat M_{eff}-\hat m)r^2 = \frac{r}{\hat\theta_1}\left(1-\frac{\hat\theta_2}{g}\right), \qquad \hat\tau_c = \hat\theta_3\hat M_{eff}\,r, \qquad \hat b = \hat\theta_4\hat M_{eff}\,r^2$$
 
 ### 9.2 State predictor
 
@@ -153,15 +177,92 @@ Because $\hat\theta_f$ now tracks the true $\theta$ (up to filter lag, and *zero
 
 So $\eta_{L1} \ll \eta$ from §8 once $\hat\theta$ has converged — the switching term becomes a thin safety net rather than the primary robustness mechanism, which is the whole point of layering L1 estimation under BLSMC: less chattering, tighter tracking, same worst-case guarantee.
 
-## 10. Open Design Items / TODO
+## 10. Implementation — `cable_torque_ctrl_node` (Retract-Positive Convention)
 
-- [ ] Quantify $\kappa$ (relative inertia/mass uncertainty) from payload test regression confidence interval
-- [ ] Fit friction residual envelope $\rho_f(v)$ from no-load test data — check whether it blows up near zero-crossing
-- [ ] Determine whether $\rho_m$ should capture cross-flight payload variability or is ~0 for fixed known payload
-- [ ] Select $k_p$, $\eta_0$, boundary layer width $\phi$ jointly — note tracking error scales as $|e_{ss}| \sim O(\phi)$, trade off against AK40-10 torque bandwidth and noise
-- [ ] Lyapunov stability proof ($V = \frac12 s^2$) to formally confirm convergence and bounded tracking error within $O(\phi)$ of sliding surface
-- [ ] Compare against UDE-based computed torque approach already in use (see companion notes on gear/friction disturbance compensation)
-- [ ] Set projection bounds for $\hat\theta$ (esp. $\hat\theta_1$ lower bound $>0$) from identified confidence intervals
-- [ ] Choose predictor gain $a_s$, adaptation gain $\Gamma$, and filter bandwidth $\omega_f$ — verify $\omega_f$ against AK40-10 torque-loop bandwidth
-- [ ] Derive explicit filter-lag bound for $\eta_{L1}$ (§9.6) rather than leaving it qualitative
-- [ ] Validate physical-parameter back-out ($\hat M_{eff}, \hat m, \hat\tau_c, \hat b$ from $\hat\theta$) against known identified values as a sanity check during simulation
+**Status:** BLSMC + UDE implemented. Friction feedforward removed — UDE handles friction as part of the unknown disturbance $\tau_d$. L1 adaptive term not yet added.
+
+### 10.1 Sign convention
+
+Implementation uses **retract-positive**: $\omega > 0$ = retracting (cable shortening, payload rising). This flips the gravity sign relative to §3–7:
+
+$$M_{eff}\,a = \frac{\tau}{r} - mg + \frac{\tau_d}{r}$$
+
+where $\tau_d$ is the total unknown disturbance (friction + model error). The UDE estimates $\tau_d$ and cancels it.
+
+### 10.2 Equivalent control (retract convention, no friction feedforward)
+
+Setting $a = a_{dyn} - k_p e_v$ (i.e. $\dot s = 0$), with $\tau_f$ removed and left to the UDE:
+
+$$\tau_{eq} = r\hat M_{eff}(a_{dyn} - k_p e_v) + \hat m g r$$
+
+where:
+- $a_{dyn} = a_{ref} - g$ — dynamic feedforward extracted from reference (waveform nodes send $a_{ref} = g + a_{dyn}$, so gravity is not double-counted)
+- $\hat m g r$ — explicit gravity compensation
+
+### 10.3 UDE (Uncertainty and Disturbance Estimator)
+
+Motor dynamics: $J\dot\omega = \tau_p + \tau_d + \tau$, where $\tau_p = -mgr$ is the known payload gravity torque and $\tau_d$ is the unknown disturbance (friction + model error).
+
+Integral update law (avoids differentiating $\omega$):
+
+$$\tau_p = -\hat m g r$$
+
+$$\text{integrand} = \hat\tau_d + \tau_p + \tau_{prev}$$
+
+$$\text{integral} \mathrel{+}= \text{integrand} \cdot \Delta t \quad \text{(frozen when } |\lambda \cdot \text{integral}| > \text{limit)}$$
+
+$$\hat\tau_d = \lambda J \omega - \lambda \cdot \text{integral}$$
+
+At steady state ($e_p=0$, $e_v=0$, $s=0$): $\tau_{applied} = mgr - \hat\tau_d$ and the integrand $= \hat\tau_d + (-mgr) + (mgr - \hat\tau_d) = 0$ — integrand settles to zero naturally regardless of $\hat\tau_d$ value.
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| $\lambda$ (`ude_lambda`) | 10.0 rad/s | Estimator bandwidth |
+| $J$ (`ude_inertia`) | 0.000995 kg·m² | Shaft moment of inertia (calibrated) |
+| limit (`ude_integral_limit`) | 0.06 N·m | Anti-windup clamp on $\lambda \cdot \text{integral}$ |
+
+### 10.4 Total control law (implemented)
+
+$$s = e_v + k_p e_p$$
+
+$$\tau_{sw} = -r\hat M_{eff}\,\eta\,\text{sat}\!\left(\frac{s}{\phi}\right)$$
+
+$$\tau = \text{sat}\!\left(\tau_{eq} + \tau_{sw} - \hat\tau_d,\; \tau_{lower},\; \tau_{upper}\right)$$
+
+The UDE estimate $\hat\tau_d$ is computed at the start of each poll cycle using $\tau_{prev}$ (the saturated torque from the previous step), then injected into the current command.
+
+### 10.5 Identified parameters (drum radius $r = 0.036$ m)
+
+| Parameter | Value | Source |
+|---|---|---|
+| $J$ | 0.000995 kg·m² | Direct regression (3 calibration bags) |
+| $m$ | 0.565 kg | Known payload mass |
+| $M_{eff} = J/r^2 + m$ | 0.768 + 0.565 = **1.333 kg** | §1.2 |
+| $\tau_p = -mgr$ | −0.199 N·m | Known gravity torque at shaft |
+
+Friction parameters ($F_c$, $F_v$) are from calibration but **not used in the control law** — the UDE estimates their effect as part of $\hat\tau_d$.
+
+### 10.6 Current tuning parameters
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| $k_p$ (`kp_c`) | 5.0 1/m | Sliding surface gain |
+| $\eta$ (`smc_eta`) | 2.0 m/s² | Switching gain — reduced to avoid chattering |
+| $\phi$ (`smc_phi`) | 0.15 m/s | Boundary layer width — widened to stay above velocity noise |
+
+Effective gains inside boundary layer: velocity damping $r M_{eff}(k_p + \eta/\phi) \approx 0.88$ N·m·s/m, position stiffness $r M_{eff}(\eta/\phi)k_p \approx 3.2$ N·m/m, max switching torque $\pm r M_{eff}\eta \approx \pm 0.096$ N·m.
+
+**Default position hold (no reference):** on `~/arm`, the current cable position $p_c$ is captured as `hold_pos_star`. When no `~/reference` is received, the controller uses `e_p = p_c − hold_pos_star` so the motor actively holds the arm position rather than only damping velocity.
+
+## 11. Open Design Items / TODO
+
+- [ ] Tune $k_p$, $\eta$, $\phi$ from experimental SMC+UDE data — tracking error scales as $O(\phi)$
+- [ ] Quantify $\kappa$ (relative $M_{eff}$ uncertainty) from payload-test regression confidence interval
+- [ ] Verify UDE convergence to friction estimate matches calibration $F_c \approx 0.056$ N·m, $F_v \approx +0.00038$ N·m·s/rad
+- [ ] Determine $\rho_m$ (mass uncertainty bound across payload changes)
+- [ ] Lyapunov stability proof ($V = \frac12 s^2$) to confirm bounded tracking error within $O(\phi)$
+- [ ] Add L1 adaptive layer (§9): state predictor + projection-based adaptation + low-pass filter
+- [ ] Set projection bounds for $\hat\theta_1$ (strictly positive lower bound) from identification confidence intervals
+- [ ] Choose $a_s$, $\Gamma$, $\omega_f$ — verify $\omega_f$ against AK40-10 torque-loop bandwidth
+- [ ] Derive explicit filter-lag bound for $\eta_{L1}$ (§9.6)
+- [ ] Validate physical-parameter back-out ($\hat M_{eff}, \hat m, \hat\tau_c, \hat b$ from $\hat\theta$) against identified values

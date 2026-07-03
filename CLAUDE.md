@@ -94,7 +94,7 @@ When done, publish `false` on `~/ext_torque_enable` — the node immediately swi
 
 Sign convention matches positive joint speed = retract. The zero reference is reset in two cases: (1) `enable_external_mode` is called (encoder zeroed at entry); (2) `~/zero_position` service is called (also resets the software tracking state).
 
-Position feedback is 16-bit over `[p_min, p_max]` (default ±12.5 rad). For drums requiring more than 12.5 rad of travel, rollover detection runs inside the node: at 100 Hz polling the maximum Δθ per sample is 0.5 rad, so any raw jump > 12.5 rad is treated as a wrap and `rollover_count_` is incremented/decremented. Drum radius default is 17.5 mm (`drum_radius` parameter, in metres).
+Position feedback is 16-bit over `[p_min, p_max]` (default ±12.5 rad). For drums requiring more than 12.5 rad of travel, rollover detection runs inside the node: at 100 Hz polling the maximum Δθ per sample is 0.5 rad, so any raw jump > 12.5 rad is treated as a wrap and `rollover_count_` is incremented/decremented. Drum radius is 36 mm (`drum_radius` parameter, in metres).
 
 **Torque limits:** `torque_limit_upper` / `torque_limit_lower` (default ±1.5 N.m; AK40-10 peak is 1.9 N.m). Configured in `config/cable_control_params.yaml`.
 
@@ -115,40 +115,96 @@ Ground station:   off  ◄── ext_mode_cmd="off"
 
 ## CableTorqueCtrlNode (`cable_torque_ctrl_node.cpp`)
 
-Standalone test and calibration node that drives `AkMotorCableControlNode` via external mode using a model-based torque control law with UDE disturbance compensation:
+Standalone test and calibration node that drives `AkMotorCableControlNode` via external mode. Three control components combined:
 
+**1. BLSMC equivalent control** (L1-adapted parameters):
 ```
-e_v        = v_c  - v_c_star
-e_p        = p_c  - p_c_star
-tau_ctrl   = mass × drum_radius × (acc_ref − kd_c × (e_v + kp_c × e_p))
-tau_d_hat  = UDE estimate (see below)
-tau        = sat(tau_ctrl − tau_d_hat, sat_upper, sat_lower)
+a_dyn    = acc_ref − g
+tau_eq   = r·M_eff_hat·(a_dyn − kp_c·e_v) + m_hat·g·r + tau_f
 ```
 
-Default when `~/reference` is not received: `acc_ref = 9.81 m/s²`, `v_c_star = 0`, `e_p = 0` — gravity hold.
+**2. Friction feedforward** (fixed calibrated params, shaft-referenced):
+```
+tau_f    = coulomb_friction·tanh(ω/deadband) + viscous_drag·ω
+```
 
-**Topic wiring:** `~/cable_state`, all `~/ext_*` topics, and `~/enable_external_mode` are remapped to `AkMotorCableControlNode` in `launch/cable_torque_ctrl.launch.py`. The `cable_ctrl_node` launch argument (default `ak_motor_cable_control_node`) controls the target node name. `~/cable_state` replaces the former pair of `~/cable_length` + `~/joint_state` subscriptions.
+**3. SMC switching term** (L1-adapted):
+```
+s        = e_v + kp_c·e_p
+tau_sw   = −r·M_eff_hat·smc_eta·sat(s/smc_phi)
+tau      = sat(tau_eq + tau_sw, sat_lower, sat_upper)
+```
+
+**L1 adaptive control** (§9, BLSMC_design.md) — estimates `theta_1 = 1/(r·M_eff)` and `theta_2 = −mg/M_eff`. Initialized from nominal parameters at startup and reset on `~/arm`/`~/disarm`:
+```
+# Predictor (uses tau_prev − tau_f_prev so friction is not absorbed into theta)
+epsilon      = v_hat − v_c
+v_hat_dot    = −a_s·epsilon + theta_hat_1·(tau_prev−tau_f_prev) + theta_hat_2
+
+# Adaptation (gradient descent with projection: theta_hat_1 ≥ theta_1_min)
+theta_hat_1 -= dt·gamma_1·(tau_prev−tau_f_prev)·epsilon
+theta_hat_2 -= dt·gamma_2·epsilon
+
+# Low-pass filter (α = 1 − exp(−omega_f·dt))
+theta_f_i   += α·(theta_hat_i − theta_f_i)
+
+# Adapted plant parameters used in control
+r·M_eff_hat  = 1 / theta_f_1
+m_hat·g·r    = −theta_f_2 / theta_f_1
+```
+
+**UDE** runs in **monitor-only** mode — `tau_d_hat` is **not** injected into control. When L1 has converged and friction feedforward is accurate, `tau_d_hat` should trend toward zero. Reset on `~/disarm`.
+
+**Default when `~/reference` is not received:** `acc_ref = g`, `v_c_star = 0`, `e_p = p_c − hold_pos_star` — position hold at the cable length captured when `~/arm` was called.
+
+**Topic wiring:** `~/cable_state`, all `~/ext_*` topics, and `~/enable_external_mode` are remapped to `AkMotorCableControlNode` in `launch/cable_torque_ctrl.launch.py`. The `cable_ctrl_node` launch argument (default `ak_motor_cable_control_node`) controls the target node name.
 
 **Arm/disarm services:**
-- `~/arm` — publishes `ext_torque_enable=true` (STANDBY → RUNNING); GUI must have already called `enable_external_mode`.
-- `~/disarm` — publishes `ext_torque_enable=false`, resets UDE state, clears `armed_`.
+- `~/arm` — captures `p_c` as `hold_pos_star_`, resets L1 state to nominal, inits predictor to current `v_c_`, publishes `ext_torque_enable=true` (STANDBY → RUNNING).
+- `~/disarm` — publishes `ext_torque_enable=false`, resets UDE and L1 state, clears `armed_`.
 
 **Motor direction:** if positive torque extends instead of retracts, set `motor_direction: -1` in `config/cable_torque_ctrl_params.yaml`. This parameter multiplies `v_c`, `p_c` (on receipt), and the output `tau` — all three must be flipped together or the controller fights itself.
 
-**Reference topic:** `~/reference` (`Float64MultiArray`, 3 elements): `[acc_ref (m/s²), v_c_star (m/s), p_c_star (m)]`. `v_c_star` and `p_c_star` use **cable_state convention** (positive = extended/extending) — the same sign as `~/cable_state` and the GUI, so the number you send matches what the GUI displays. `acc_ref` is in the retraction frame (`g` for gravity hold). Goes stale after `reference_timeout_ms` (default 500 ms), falling back to gravity hold with a throttled `[WARN]`.
+**Reference topic:** `~/reference` (`Float64MultiArray`, 3 elements): `[acc_ref (m/s²), v_c_star (m/s), p_c_star (m)]`. `v_c_star` and `p_c_star` use **cable_state convention** (positive = extended/extending). Goes stale after `reference_timeout_ms` (default 500 ms), falling back to gravity hold at arm position.
 
-**UDE (Uncertainty and Disturbance Estimator):** compensates unknown residual disturbance `tau_d` in gear/cable dynamics. Motor model: `J·dω/dt = tau_p + tau_d + tau`, where `tau_p = −mass × drum_radius × g` (known payload gravity torque) and `tau` is the final capped motor torque from the previous step. Integral update law (avoids differentiating ω):
-```
-tau_p          = −mass × drum_radius × g     (≈ −0.097 N·m for default params)
-integrand      = tau_d_hat + tau_p + tau_applied_prev
-integral_term += integrand × dt        (frozen when |λ × integral_term| > ude_integral_limit)
-tau_d_hat      = λ × J × ω − λ × integral_term
-```
-At steady state with zero position error, `tau_p + tau_ctrl = 0` so the integrand naturally settles to zero — no steady-state position error. State is reset to zero on `~/disarm`. Parameters: `ude_lambda` (bandwidth, default 10 rad/s), `ude_inertia` (J, default 0.001 kg·m²), `ude_integral_limit` (±0.06 N·m).
+**Key parameters** (`config/cable_torque_ctrl_params.yaml`):
 
-**Debug topic:** `~/debug` (`Float64MultiArray`): `[tau, e_v, e_p, v_c, p_c, acc_ref, 0.0, tau_d_hat]` — index 6 is unused/reserved. Publishes post-saturation torque, all intermediate control variables, and UDE estimate every poll cycle.
+| Group | Parameter | Default | Description |
+|---|---|---|---|
+| BLSMC | `kp_c` | 5.0 | 1/m — sliding surface gain |
+| BLSMC | `smc_eta` | 2.0 | m/s² — switching gain |
+| BLSMC | `smc_phi` | 0.15 | m/s — boundary layer width |
+| Friction | `coulomb_friction` | 0.0559 | N·m — Coulomb friction (calibrated) |
+| Friction | `viscous_drag` | 0.00038 | N·m·s/rad — viscous drag (calibrated) |
+| Friction | `friction_velocity_deadband` | 0.5 | rad/s — tanh smoothing near zero |
+| L1 | `l1_as` | 50.0 | rad/s — predictor gain |
+| L1 | `l1_gamma_1` | 5.0 | adaptation gain for theta_1 |
+| L1 | `l1_gamma_2` | 5.0 | adaptation gain for theta_2 |
+| L1 | `l1_omega_f` | 5.0 | rad/s — filter bandwidth (time constant 0.2 s) |
+| L1 | `l1_theta_1_min` | 2.0 | projection lower bound on theta_1 |
+| UDE | `ude_lambda` | 10.0 | rad/s — estimator bandwidth |
+| UDE | `ude_inertia` | 0.000995 | kg·m² — shaft inertia J (calibrated) |
+| UDE | `ude_integral_limit` | 0.06 | N·m — anti-windup clamp |
 
-**UDE disturbance topic:** `~/ude_disturbance` (`Float64`): `tau_d_hat` in N·m — published every poll cycle for GUI monitoring.
+**Debug topic:** `~/debug` (`Float64MultiArray`, 13 elements):
+
+| Index | Field | Unit | Description |
+|---|---|---|---|
+| 0 | `tau` | N·m | Total post-saturation command |
+| 1 | `e_v` | m/s | Cable velocity error |
+| 2 | `e_p` | m | Cable position error |
+| 3 | `v_c` | m/s | Actual cable velocity |
+| 4 | `p_c` | m | Actual cable position |
+| 5 | `acc_ref` | m/s² | Active reference acceleration |
+| 6 | `s` | m/s | Sliding surface value |
+| 7 | `tau_d_hat` | N·m | UDE estimate (monitor only) |
+| 8 | `tau_eq` | N·m | Equivalent control (gravity+inertia+friction, L1 adapted) |
+| 9 | `tau_sw` | N·m | SMC switching term (L1 adapted) |
+| 10 | `tau_f` | N·m | Friction feedforward component |
+| 11 | `theta_f_1` | — | L1 filtered theta_1 ≈ 1/(r·M_eff_hat) |
+| 12 | `theta_f_2` | m/s² | L1 filtered theta_2 ≈ −mg/M_eff_hat |
+
+**UDE disturbance topic:** `~/ude_disturbance` (`Float64`): `tau_d_hat` in N·m — monitor only.
 
 **Waveform reference nodes** — publish to `~/reference` of `cable_torque_ctrl_node`, launched in a separate terminal while the controller is running and armed:
 
@@ -161,7 +217,7 @@ At steady state with zero position error, `tau_p + tau_ctrl = 0` so the integran
 
 All waveform launch files remap `~/reference` → `/cable_torque_ctrl_node/reference` automatically.
 
-**Calibration rosbag:**
+**Calibration rosbag** (saved to the current working directory — run from `~` to keep bags in the home folder):
 ```bash
 ros2 bag record \
   /ak_motor_cable_control_node/ext_torque_cmd \
@@ -169,6 +225,15 @@ ros2 bag record \
   /cable_torque_ctrl_node/ude_disturbance \
   /cable_torque_ctrl_node/reference \
   -o calibration_bag
+```
+For BLSMC-only validation (UDE monitor, no reference topic needed):
+```bash
+ros2 bag record \
+  /ak_motor_cable_control_node/ext_torque_cmd \
+  /ak_motor_cable_control_node/cable_state \
+  /cable_torque_ctrl_node/ude_disturbance \
+  /cable_torque_ctrl_node/reference \
+  -o calibration_smc_only
 ```
 
 ## Platform differences
