@@ -6,24 +6,27 @@ cable_torque_ctrl_node:
     mass: 0.565                  # kg (565 g)
     # Control gains
     # tau = sat(mass * drum_radius * (acc_ref - kd_c * (e_v + kp_c * e_p)), sat_upper, sat_lower)
-    kp_c: 8.0                  # 1/m   cable position error gain
+    kp_c: 5.0                  # 1/m   cable position error gain
     kd_c: 20.0                  # s/m   cable velocity error gain
     sat_upper:  1.5            # N.m   torque saturation upper bound
     sat_lower: -1.5            # N.m   torque saturation lower bound
     motor_direction: 1         # 1 or -1: set to -1 if positive torque extends instead of retracts
-    # Friction compensation (Coulomb + viscous model, from calibration)
-    # tau_friction = coulomb_friction * tanh(omega / friction_velocity_deadband) + viscous_drag * omega
-    coulomb_friction:           0.0203    # N.m       (from no-load calibration, R²=0.998)
-    viscous_drag:               0.00140   # N.m·s/rad (from no-load calibration)
+    # Identified drivetrain parameters (from calibration bags: sine + square + triangle)
+    # Combined friction fit (UDE-based, R²=0.9795):  Fc=0.0559 N·m, Fv=-0.01001 N·m·s/rad (artifact)
+    # Direct regression fit (raw measurements, R²=0.880): J=0.000995 kg·m², Fc=0.0473 N·m, Fv=+0.00038 N·m·s/rad
+    # Use direct-regression Fv (positive, physically sensible); use combined-fit Fc (more samples, higher R²)
+    coulomb_friction:           0.0559    # N.m       (Coulomb/static friction, shaft-referenced)
+    viscous_drag:               0.00038   # N.m·s/rad (viscous damping, shaft-referenced; positive)
     friction_velocity_deadband: 0.5       # rad/s     (tanh smoothing window near zero)
     # UDE — Uncertainty and Disturbance Estimator
     # Motor dynamics: J*dω/dt = tau_p + tau_d + tau
-    #   tau_p = -m*g*r  (known payload gravity torque)
+    #   tau_p = -m*g*r  (known payload gravity torque; = -0.565*9.81*0.036 ≈ -0.199 N·m)
     #   tau   = final capped motor torque
-    #   tau_d = unknown residual disturbance (gear friction, unmodeled dynamics)
+    #   tau_d = unknown residual disturbance
     # tau_d_hat = lambda*J*omega - lambda*integral(tau_d_hat + tau_p + tau)
+    # Derived: M_eff = J/r² = 0.000995/0.036² ≈ 0.768 kg
     ude_lambda:         10.0    # rad/s  estimator bandwidth (higher = faster but more noise)
-    ude_inertia:        0.001   # kg·m²  motor moment of inertia J
+    ude_inertia:        0.000995  # kg·m²  shaft moment of inertia J (from direct regression)
     ude_integral_limit: 0.06    # N·m    anti-windup clamp on lambda*integral_term (±limit)
     # Timing
     poll_rate_hz: 100.0
