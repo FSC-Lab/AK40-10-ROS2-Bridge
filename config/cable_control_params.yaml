@@ -15,9 +15,12 @@ ak_motor_cable_control_node:
     kd_max:   5.0  # Nms/rad
     # Speed mode gain (kp is always 0 in speed mode)
     kd_speed: 0.5   # Nms/rad
-    # Position mode gains
-    kp_pos: 1.0     # Nm/rad
-    kd_pos: 0.3     # Nms/rad
+    # Position mode: target = cable length below the stopper (m); needs auto zero.
+    # P loop on cable length -> speed command (inner loop uses kd_speed).
+    pos_kp:         2.0    # 1/s, cable speed per metre of error
+    pos_max_speed:  0.1    # m/s
+    pos_min_length: 0.01   # m, targets outside [min, max] are ignored
+    pos_max_length: 0.9    # m
     # Safety
     command_timeout_ms: 500.0
     kd_watchdog: 0.05
@@ -29,13 +32,14 @@ ak_motor_cable_control_node:
     # Cable drum geometry
     drum_radius: 0.036           # m (36 mm)
     # Auto zero (~/auto_zero): retract until the cable stopper hits the housing.
-    # Run with no payload. Stall torque cap = homing_kd * homing_speed (0.4 N.m ~ 11 N on cable).
-    homing_speed:          1.0     # rad/s retract (~36 mm/s)
-    homing_kd:             0.4     # N.m.s/rad
-    homing_contact_torque: 0.25    # N.m measured torque => contact (must be < kd * speed)
+    # Run with no payload. Stall torque cap = homing_kd * homing_speed
+    # = 0.175 N.m ~ 4.9 N (~500 g) on the cable.
+    homing_speed:          1.0     # rad/s retract command (~36 mm/s; ~20 mm/s actual vs friction)
+    homing_kd:             0.175   # N.m.s/rad
+    homing_contact_torque: 0.125   # N.m measured torque => contact (must be < kd * speed)
     homing_stall_speed:    0.2     # rad/s, |vel| below this counts as stalled
     homing_debounce_ms:    100.0   # contact must hold this long
     homing_blanking_ms:    300.0   # ignore breakaway at start
     homing_max_travel:     1.2     # m retracted before giving up
     homing_backoff:        0.015   # m paid out after contact (park position)
-    homing_timeout_s:      60.0
+    homing_timeout_s:      90.0    # > homing_max_travel / actual retract speed

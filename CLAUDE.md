@@ -23,12 +23,13 @@ Three layers, each in its own library or executable:
 3. **`AkMotorNode`** (`ak_motor_node.cpp`) — single `rclcpp::Node` that owns both a `CanSocket` and an `Ak40Codec`. A wall timer at `poll_rate_hz` (default 100 Hz) calls `send_command()` when enabled, then drains all pending CAN frames and publishes state.
 
 4. **`AkMotorCableControlNode`** (`ak_motor_cable_control_node.cpp`) — GUI-facing node for cable-driven systems. Replaces `AkMotorNode` when a ground station GUI is involved. Key differences from `AkMotorNode`:
-   - Three control modes selectable at runtime via `~/mode_cmd` (`std_msgs/String`: `"speed"`, `"torque"`, `"pos"`). Default is **SPEED** (`kp=0, kd=kd_speed` default 0.5).
+   - Three control modes selectable at runtime via `~/mode_cmd` (`std_msgs/String`: `"speed"`, `"torque"`, `"pos"`). Default is **SPEED** (`kp=0, kd=kd_speed` default 0.5). `"pos"` is **not** MIT position control: see § Position mode below.
+   - **Every `~/mode_cmd` re-arms a hold** (`enter_mode_hold()`), including a repeat of the current mode: SPEED → zero velocity, POSITION → current cable length, TORQUE → zero torque. Nothing streamed for the previous mode carries over. The GUI Stop button sends the current mode to get this hold; external-mode exit restores the previous mode through the same function.
    - Gains are cached at startup and refreshed only when a mode switch arrives — the GUI never calls `ros2 param set`. On mode switch, gains are re-read from the parameter server and logged.
    - Mode mismatch detection: if `~/command` contains non-zero fields that don't belong to the current mode, a throttled `[WARN]` is printed. The correct field is still processed.
    - Dual heartbeat watchdog: `~/heartbeat` (primary, from GUI) and `~/heartbeat_external` (backup). Motor stays enabled if **either** source is fresh within `heartbeat_timeout_ms` (default 1000 ms); disables only when **both** go stale.
    - Publishes `~/enabled` (`std_msgs/Bool`), `~/control_mode` (`std_msgs/String`: `"speed"`, `"torque"`, `"pos"`, or `"external"` when external mode is STANDBY/RUNNING), and `~/node_heartbeat` (`std_msgs/Empty`) every poll cycle so the GUI can monitor node liveness and motor state.
-   - Command watchdog: if `~/command` goes stale beyond `command_timeout_ms` (default 500 ms), drops to `kp=0, kd=kd_watchdog`.
+   - Command watchdog: if `~/command` goes stale beyond `command_timeout_ms` (default 500 ms), drops to `kp=0, kd=kd_watchdog`. Not applied in POSITION mode (a held target is safe; heartbeat loss still disables).
    - `~/zero_position` service: rejects while enabled (same guard as `AkMotorNode`).
    - Sends `exit_mit_mode` on startup to clear any armed state from a previous crashed session.
    - **External mode** for handing torque control to another ROS node (e.g. a cable tension controller). See § External mode below.
@@ -47,11 +48,13 @@ Three layers, each in its own library or executable:
 **Temperature auto-disable:** after each feedback frame is decoded, temperature is checked against `temp_limit_c` (default 75°C). If exceeded, `exit_mit_mode()` is sent immediately and `enabled_` is cleared.
 
 **MIT torque formula:** `tau = kp*(p_des - p) + kd*(v_des - v) + t_ff`. Three control modes follow from this:
-- **Position:** `kp>0, kd>0`, set `position` field. Motor holds position with damping.
+- **Position:** `kp>0, kd>0`, set `position` field. Motor holds position with damping. (`AkMotorNode` only — the cable control node no longer uses MIT position; raw `p_des` is limited to ±12.5 rad and wraps.)
 - **Velocity:** `kp=0, kd>0`, set `velocity` field. Motor tracks velocity; `kd` sets responsiveness.
 - **Torque-direct:** `kp=0, kd=0`, set `effort` field. Used by slung load node.
 
 With default `kp=1.0`, publishing a velocity command has little effect — the position error term dominates. Set `kp=0` first for velocity or torque modes.
+
+**Position mode (cable control node):** `~/command` `position[0]` = target cable length **below the stopper** (m, `data[2]` frame). Requires `homed_`: `enter_mode_hold(POSITION)` refuses without it (→ SPEED zero-velocity hold + `[WARN]`), and `~/zero_position` drops POSITION to SPEED. `position_command()` runs every poll tick: `v_cable = clamp(pos_kp × (pos_target_ − cable_length_from_home()), ±pos_max_speed)`, sent as `kp=0, kd=kd_speed, v = −v_cable / drum_radius`. Working on `theta_unwrapped_` makes it immune to the encoder wrap; the clamp caps cable speed (default 0.1 m/s). Targets outside `[pos_min_length, pos_max_length]` are ignored with a throttled `[WARN]`. `pos_target_` is re-captured from the current length on every entry and on the first feedback after `~/enable` (`pending_pos_hold_`; zero velocity until then), so it never pulls back to an old target. Static friction (Fc ≈ 0.056 N.m) leaves ≲ 2 mm steady-state error at `pos_kp = 2`, `kd_speed = 0.5`.
 
 **Operating order matters:**
 1. Publish `~/command` before calling `~/enable` — prevents the watchdog from firing on startup.
@@ -72,7 +75,7 @@ Topics and services:
 | `~/enable_external_mode` | `Trigger` | service | `off → standby`; re-zeros `data[0]` in software; rejects if already active or auto zero is running |
 | `~/ext_torque_enable` | `Bool` | sub | `true`: `standby → running`; `false`: `running → standby` (motor holds zero velocity) |
 | `~/ext_torque_cmd` | `Float32` (N.m) | sub | Torque command; ignored unless `running`; clamped to `[torque_limit_lower, torque_limit_upper]` with `[WARN]` if limit hit |
-| `~/ext_mode_cmd` | `String` | sub | `"off"`: exit external mode, restore previous control mode |
+| `~/ext_mode_cmd` | `String` | sub | `"off"`: exit external mode, restore previous control mode (as a hold) |
 | `~/ext_mode_state` | `String` | pub | Publishes `"off"` / `"standby"` / `"running"` every poll cycle |
 | `~/control_mode` | `String` | pub | Publishes `"external"` whenever external mode is STANDBY or RUNNING; reverts to `"speed"` / `"torque"` / `"pos"` when `off` |
 
@@ -83,7 +86,7 @@ Correct activation sequence for an external controller node:
 4. Confirm `~/ext_mode_state` publishes `"running"`
 5. Start publishing on `~/ext_torque_cmd`
 
-When done, publish `false` on `~/ext_torque_enable` — the node immediately switches to zero-velocity SPEED mode. The external controller is then responsible for publishing a legitimate velocity command on `~/command`. Publish `"off"` on `~/ext_mode_cmd` to fully exit external mode and restore the previously active control mode.
+When done, publish `false` on `~/ext_torque_enable` — the node immediately switches to zero-velocity SPEED mode. The external controller is then responsible for publishing a legitimate velocity command on `~/command`. Publish `"off"` on `~/ext_mode_cmd` to fully exit external mode and restore the previously active control mode as a hold (`enter_mode_hold(prev_control_mode_)` — POSITION holds where the cable is now, not the pre-entry target).
 
 **Overtemperature while in external mode:** external mode is cleared, motor is disabled, and the node falls back to zero-velocity SPEED mode (same as the `running → standby` transition).
 
@@ -97,12 +100,12 @@ When done, publish `false` on `~/ext_torque_enable` — the node immediately swi
 Sign convention matches positive joint speed = retract. `theta_rel_ref_` (zero of `data[0]`) moves on: auto zero contact, `enable_external_mode`, and `~/zero_position`. `theta_home_` (zero of `data[2]`) moves only on auto zero contact. `~/zero_position` zeros the encoder itself, so `reset_cable_length_tracking()` clears every reference and `homed_`.
 
 **Auto zero** (`~/auto_zero`, `HomingState`): retracts until a stopper on the cable hits the housing, then backs off. Run with no payload. Logic lives in `update_homing()` (called per feedback frame after `update_cable_length()`); the motor command comes from the `homing_active()` branch in `send_command()`, ahead of the command-timeout watchdog.
-- `SEEKING`: `kp=0, kd=homing_kd, v=+homing_speed`. The speed loop caps stall torque at `homing_kd × homing_speed` — that bound holds even if detection fails, so keep it small (default 0.4 N.m ≈ 11 N).
+- `SEEKING`: `kp=0, kd=homing_kd, v=+homing_speed`. The speed loop caps stall torque at `homing_kd × homing_speed` — that bound holds even if detection fails, so keep it small (default 0.175 N.m ≈ 4.9 N ≈ 500 g). Free retract then runs at ~60% of `homing_speed` (friction ≈ 0.074 N.m incl. hook). If homing false-triggers before reaching the stopper, friction is eating the headroom: raise `homing_speed` and lower `homing_kd` to keep the product (the cap) the same.
 - Contact: `torque ≥ homing_contact_torque && |ω| ≤ homing_stall_speed` for `homing_debounce_ms` (after `homing_blanking_ms`). Sets `theta_home_ = theta_rel_ref_ = theta_unwrapped_`, `homed_ = true`.
 - `BACKING_OFF`: `v = −homing_speed` until `data[2] ≥ homing_backoff`, then `HOMED` with a zero-velocity SPEED hold.
 - `FAILED:<reason>`: any `~/command` / `~/mode_cmd` (GUI Stop/E-stop), `!enabled_` (disable, heartbeat loss, overtemp), travel > `homing_max_travel`, `homing_timeout_s`, velocity < −stall speed (cable dragged out — payload attached), or stalled 1 s without torque reaching the threshold (torque sign/threshold wrong). Clears `homed_`, holds zero velocity.
 - A reversed winding is **not** detectable from motor feedback (encoder and command share the motor frame); `homing_max_travel` is the backstop.
-- With the defaults (cap 0.4 N.m, stall speed 0.2 rad/s, Fc ≈ 0.056 N.m, r = 36 mm), a payload of roughly 0.75–1.5 kg stalls mid-air with torque above the threshold → **false zero**; heavier ones are dragged out (→ `failed`), lighter ones still reach the stopper. This is why homing is payload-free.
+- With the defaults (cap 0.175 N.m, stall speed 0.2 rad/s, Fc ≈ 0.056 N.m, r = 36 mm), a total hanging mass of roughly 0.25–0.75 kg stalls mid-air with torque above the threshold → **false zero**; heavier is dragged out (→ `failed`), lighter (< ~0.25 kg, i.e. stopper + hook) reaches the stopper. This is why homing is payload-free.
 - Published every poll cycle on `~/homing_state` (`String`): `unhomed`, `seeking`, `backing_off`, `homed`, `failed:<reason>`.
 
 Position feedback is 16-bit over `[p_min, p_max]` (default ±12.5 rad). For drums requiring more than 12.5 rad of travel, rollover detection runs inside the node: at 100 Hz polling the maximum Δθ per sample is 0.5 rad, so any raw jump > 12.5 rad is treated as a wrap and `rollover_count_` is incremented/decremented. Drum radius is 36 mm (`drum_radius` parameter, in metres).

@@ -223,15 +223,17 @@ Gains are loaded from the parameter file at startup and refreshed each time a mo
 |---|---|---|
 | `speed` | `kp=0`, `kd=kd_speed` | `kd_speed` (default 0.5) |
 | `torque` | `kp=0`, `kd=0` | — |
-| `pos` | `kp=kp_pos`, `kd=kd_pos` | `kp_pos` (default 1.0), `kd_pos` (default 0.3) |
+| `pos` | `kp=0`, `kd=kd_speed`, velocity from a cable-length P loop | `pos_kp` (default 2.0 1/s), `pos_max_speed` (default 0.1 m/s) |
 
 If `~/command` contains non-zero fields that don't belong to the current mode, the node logs a `[WARN]` and ignores those fields.
+
+**Mode switches always hold.** Every `~/mode_cmd` — including re-sending the current mode — discards the active command and holds: `speed` → zero velocity, `pos` → current cable length, `torque` → zero torque. A command streamed for the old mode can't carry over. The GUI Stop button re-sends the current mode for this reason. Leaving external mode restores the previous mode the same way.
 
 ### Timeouts
 
 | Parameter | Default | Effect when exceeded |
 |---|---|---|
-| `command_timeout_ms` | 500 ms | Drops to `kp=0, kd=kd_watchdog` (pure damping) |
+| `command_timeout_ms` | 500 ms | Drops to `kp=0, kd=kd_watchdog` (pure damping). **Not applied in `pos` mode**, which keeps holding its last target |
 | `heartbeat_timeout_ms` | 1000 ms | Disables motor if **both** heartbeat sources are stale |
 
 ### Services
@@ -260,6 +262,36 @@ ros2 topic pub --rate 50 /ak_motor_cable_control_node/command sensor_msgs/msg/Jo
   "{name: ['ak40_10'], position: [0.0], velocity: [1.0], effort: [0.0]}"
 ```
 
+### Position mode (metres below the stopper)
+
+`position[0]` of `~/command` is the **target cable length below the stopper in metres** —
+the same frame as `~/cable_state` `data[2]`. Requires a completed auto zero: `mode_cmd "pos"`
+without one is refused (the node holds zero velocity in `speed` and warns), and `pos` drops back
+to `speed` if the zero is lost (`~/zero_position`).
+
+- The node runs the loop itself: `v_cable = clamp(pos_kp × (target − length), ±pos_max_speed)`,
+  sent to the motor as a speed command (`kp=0, kd=kd_speed`). It works on the unwrapped angle,
+  so the ±12.5 rad encoder wrap doesn't matter, and the cable never moves faster than
+  `pos_max_speed`.
+- Targets outside `[pos_min_length, pos_max_length]` are ignored (`[WARN]`, previous target kept).
+- Entering `pos` (mode switch, external-mode exit, re-enable) holds the current length; it never
+  jumps to an old target.
+- Static friction leaves up to ~2 mm steady-state error with the default gains; raise `pos_kp`
+  to tighten it.
+
+```bash
+ros2 topic pub --once /ak_motor_cable_control_node/mode_cmd std_msgs/msg/String "{data: 'pos'}"
+ros2 topic pub --once /ak_motor_cable_control_node/command sensor_msgs/msg/JointState \
+  "{name: ['ak40_10'], position: [0.30], velocity: [0.0], effort: [0.0]}"   # 0.30 m below stopper
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `pos_kp` | `2.0` 1/s | Cable speed per metre of error |
+| `pos_max_speed` | `0.1` m/s | Cable speed cap |
+| `pos_min_length` | `0.01` m | Lowest accepted target (keeps the stopper off the housing) |
+| `pos_max_length` | `0.9` m | Highest accepted target |
+
 ### Auto zero (cable stopper homing)
 
 A stopper part on the cable defines a repeatable zero. `~/auto_zero` retracts the cable
@@ -273,8 +305,9 @@ unhomed/homed/failed ──~/auto_zero──► seeking ──contact──► b
 ```
 
 - **Retract** uses a speed loop with its own gain: `kp=0, kd=homing_kd, v=+homing_speed`.
-  Stall torque can never exceed `homing_kd × homing_speed` (default 0.4 N.m ≈ 11 N on the
-  cable), so that is the most force the stopper ever sees.
+  Stall torque can never exceed `homing_kd × homing_speed` (default 0.175 N.m ≈ 4.9 N ≈ 500 g
+  on the cable), so that is the most force the stopper ever sees. Against friction the cable
+  actually retracts at ~20 mm/s.
 - **Contact** = measured torque ≥ `homing_contact_torque` AND |velocity| ≤ `homing_stall_speed`,
   held for `homing_debounce_ms`, after a `homing_blanking_ms` start-up window.
 - **Zero is software-only:** the unwrapped shaft angle at contact is stored; the motor's
@@ -300,22 +333,21 @@ unhomed/homed/failed ──~/auto_zero──► seeking ──contact──► b
 ros2 service call /ak_motor_cable_control_node/enable std_srvs/srv/Trigger
 ros2 service call /ak_motor_cable_control_node/auto_zero std_srvs/srv/Trigger
 ros2 topic echo /ak_motor_cable_control_node/homing_state
-# Abort: publish any command (this is what the GUI Stop button does)
-ros2 topic pub --once /ak_motor_cable_control_node/command sensor_msgs/msg/JointState \
-  "{name: ['ak40_10'], position: [0.0], velocity: [0.0], effort: [0.0]}"
+# Abort: any ~/command or ~/mode_cmd (the GUI Stop button re-sends the current mode)
+ros2 topic pub --once /ak_motor_cable_control_node/mode_cmd std_msgs/msg/String "{data: 'speed'}"
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
-| `homing_speed` | `1.0` rad/s | Retract / back-off speed (~36 mm/s) |
-| `homing_kd` | `0.4` N.m.s/rad | Speed-loop gain; stall cap = `homing_kd × homing_speed` |
-| `homing_contact_torque` | `0.25` N.m | Measured torque threshold (must be below the stall cap) |
+| `homing_speed` | `1.0` rad/s | Retract / back-off speed command (~36 mm/s; ~20 mm/s actual) |
+| `homing_kd` | `0.175` N.m.s/rad | Speed-loop gain; stall cap = `homing_kd × homing_speed` (≈ 500 g) |
+| `homing_contact_torque` | `0.125` N.m | Measured torque threshold (between free-retract ~0.074 and the cap) |
 | `homing_stall_speed` | `0.2` rad/s | Below this counts as stalled |
 | `homing_debounce_ms` | `100` | Contact must hold this long |
 | `homing_blanking_ms` | `300` | Start-up window ignored (breakaway) |
 | `homing_max_travel` | `1.2` m | Retract distance before giving up |
 | `homing_backoff` | `0.015` m | Pay-out after contact (park position) |
-| `homing_timeout_s` | `60` s | Overall seek timeout |
+| `homing_timeout_s` | `90` s | Overall seek timeout (> `homing_max_travel` / actual speed) |
 
 ### External mode
 

@@ -48,8 +48,10 @@ class AkMotorCableControlNode : public rclcpp::Node {
     declare_parameter("kp_max", 500.0);
     declare_parameter("kd_max", 5.0);
     declare_parameter("kd_speed", 0.5);
-    declare_parameter("kp_pos", 1.0);
-    declare_parameter("kd_pos", 0.3);
+    declare_parameter("pos_kp", 2.0);                 // 1/s, cable speed per metre of error
+    declare_parameter("pos_max_speed", 0.1);          // m/s
+    declare_parameter("pos_min_length", 0.01);        // m below stopper
+    declare_parameter("pos_max_length", 0.9);         // m below stopper
     declare_parameter("command_timeout_ms", 500.0);
     declare_parameter("kd_watchdog", 0.05);
     declare_parameter("heartbeat_timeout_ms", 1000.0);
@@ -58,14 +60,14 @@ class AkMotorCableControlNode : public rclcpp::Node {
     declare_parameter("torque_limit_lower", -1.5);   // N.m
     declare_parameter("drum_radius", 0.0175);         // m
     declare_parameter("homing_speed", 1.0);           // rad/s, retract
-    declare_parameter("homing_kd", 0.4);              // N.m.s/rad; stall torque cap = kd * speed
-    declare_parameter("homing_contact_torque", 0.25); // N.m
+    declare_parameter("homing_kd", 0.175);            // N.m.s/rad; stall torque cap = kd * speed
+    declare_parameter("homing_contact_torque", 0.125); // N.m
     declare_parameter("homing_stall_speed", 0.2);     // rad/s
     declare_parameter("homing_debounce_ms", 100.0);
     declare_parameter("homing_blanking_ms", 300.0);
     declare_parameter("homing_max_travel", 1.2);      // m
     declare_parameter("homing_backoff", 0.015);       // m
-    declare_parameter("homing_timeout_s", 60.0);
+    declare_parameter("homing_timeout_s", 90.0);
 
     const std::string can_iface = get_parameter("can_interface").as_string();
     const uint8_t motor_id = static_cast<uint8_t>(get_parameter("motor_id").as_int());
@@ -76,8 +78,10 @@ class AkMotorCableControlNode : public rclcpp::Node {
     heartbeat_timeout_ms_ = get_parameter("heartbeat_timeout_ms").as_double();
     temp_limit_c_         = get_parameter("temp_limit_c").as_double();
     kd_speed_ = get_parameter("kd_speed").as_double();
-    kp_pos_   = get_parameter("kp_pos").as_double();
-    kd_pos_   = get_parameter("kd_pos").as_double();
+    pos_kp_         = get_parameter("pos_kp").as_double();
+    pos_max_speed_  = get_parameter("pos_max_speed").as_double();
+    pos_min_length_ = get_parameter("pos_min_length").as_double();
+    pos_max_length_ = get_parameter("pos_max_length").as_double();
     torque_limit_upper_ = get_parameter("torque_limit_upper").as_double();
     torque_limit_lower_ = get_parameter("torque_limit_lower").as_double();
     drum_radius_        = get_parameter("drum_radius").as_double();
@@ -219,6 +223,9 @@ class AkMotorCableControlNode : public rclcpp::Node {
                std_srvs::srv::Trigger::Response::SharedPtr resp) {
           can_socket_->write(codec_->enter_mit_mode());
           enabled_ = true;
+          // The cable may have moved while limp: a POSITION hold re-targets to where
+          // it is now (first feedback frame) instead of pulling back to the old target.
+          pending_pos_hold_ = true;
           resp->success = true;
           resp->message = "Motor enabled (MIT mode)";
           RCLCPP_INFO(get_logger(), "Motor enabled");
@@ -247,6 +254,8 @@ class AkMotorCableControlNode : public rclcpp::Node {
           can_socket_->write(codec_->set_zero_position());
           reset_cable_length_tracking();
           homing_state_ = HomingState::UNHOMED;  // manual zero is not stopper-referenced
+          // POSITION targets are metres below the stopper, which is gone now.
+          if (control_mode_ == ControlMode::POSITION) { hold_zero_velocity(); }
           resp->success = true;
           resp->message = "Zero position set";
           RCLCPP_INFO(get_logger(), "Zero position set");
@@ -369,37 +378,46 @@ class AkMotorCableControlNode : public rclcpp::Node {
         break;
 
       case ControlMode::POSITION:
-        if (eff != 0.0) {
+        // position[0] = target cable length below the stopper (m); see position_command().
+        if (vel != 0.0 || eff != 0.0) {
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-              "Mode mismatch: POSITION mode only uses position/velocity fields "
-              "(got effort=%.3f — ignoring)", eff);
+              "Mode mismatch: POSITION mode only uses position field (m below stopper) "
+              "(got velocity=%.3f effort=%.3f — ignoring)", vel, eff);
         }
-        current_cmd_.position  = pos;
-        current_cmd_.velocity  = vel;
-        current_cmd_.torque_ff = 0.0;
-        current_cmd_.kp        = kp_pos_;
-        current_cmd_.kd        = kd_pos_;
+        if (pos < pos_min_length_ || pos > pos_max_length_) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+              "Position target %.3f m outside [%.3f, %.3f] m — ignored, holding %.3f m",
+              pos, pos_min_length_, pos_max_length_, pos_target_);
+          break;
+        }
+        pos_target_ = pos;
         break;
     }
     last_cmd_time_ = now();
     has_command_   = true;
   }
 
+  // Every mode command, including a repeat of the current mode, replaces the active
+  // command with a hold in that mode (see enter_mode_hold), so nothing from before the
+  // switch carries over. The GUI Stop button relies on this.
   void on_mode_cmd(const std_msgs::msg::String::SharedPtr msg) {
     if (homing_active()) { fail_homing("aborted by ~/mode_cmd"); }
     const std::string& m = msg->data;
     if (m == "speed") {
-      control_mode_ = ControlMode::SPEED;
       kd_speed_ = get_parameter("kd_speed").as_double();
-      RCLCPP_INFO(get_logger(), "Control mode -> SPEED (kd=%.3f)", kd_speed_);
+      enter_mode_hold(ControlMode::SPEED);
+      RCLCPP_INFO(get_logger(), "Control mode -> SPEED (kd=%.3f), holding zero velocity", kd_speed_);
     } else if (m == "torque") {
-      control_mode_ = ControlMode::TORQUE;
-      RCLCPP_INFO(get_logger(), "Control mode -> TORQUE");
+      enter_mode_hold(ControlMode::TORQUE);
+      RCLCPP_INFO(get_logger(), "Control mode -> TORQUE, zero torque");
     } else if (m == "pos") {
-      control_mode_ = ControlMode::POSITION;
-      kp_pos_ = get_parameter("kp_pos").as_double();
-      kd_pos_ = get_parameter("kd_pos").as_double();
-      RCLCPP_INFO(get_logger(), "Control mode -> POSITION (kp=%.3f kd=%.3f)", kp_pos_, kd_pos_);
+      pos_kp_        = get_parameter("pos_kp").as_double();
+      pos_max_speed_ = get_parameter("pos_max_speed").as_double();
+      if (enter_mode_hold(ControlMode::POSITION)) {
+        RCLCPP_INFO(get_logger(),
+                    "Control mode -> POSITION (kp=%.2f 1/s, max %.3f m/s), holding %.3f m below stopper",
+                    pos_kp_, pos_max_speed_, pos_target_);
+      }
     } else {
       RCLCPP_WARN(get_logger(), "Unknown mode '%s' (valid: speed, torque, pos)", m.c_str());
     }
@@ -460,6 +478,9 @@ class AkMotorCableControlNode : public rclcpp::Node {
       cmd.position  = 0.0;
       cmd.velocity  = homing_state_ == HomingState::SEEKING ? homing_speed_ : -homing_speed_;
       cmd.torque_ff = 0.0;
+    } else if (control_mode_ == ControlMode::POSITION) {
+      // No command timeout: holding a target is safe, and heartbeat loss still disables.
+      cmd = position_command();
     } else if (!has_command_ || elapsed_ms > command_timeout_ms_) {
       cmd.kp        = 0.0;
       cmd.kd        = kd_watchdog_;
@@ -615,6 +636,47 @@ class AkMotorCableControlNode : public rclcpp::Node {
     last_cmd_time_  = now();
   }
 
+  // Switches to `mode` with a hold command, so nothing from the previous mode carries
+  // over: SPEED holds zero velocity, TORQUE applies zero torque, POSITION holds the
+  // current cable length. POSITION needs the homed zero; without it, falls back to
+  // SPEED and returns false.
+  bool enter_mode_hold(ControlMode mode) {
+    switch (mode) {
+      case ControlMode::SPEED:
+        hold_zero_velocity();
+        return true;
+      case ControlMode::TORQUE:
+        control_mode_  = ControlMode::TORQUE;
+        current_cmd_   = MitCommand{};
+        has_command_   = true;
+        last_cmd_time_ = now();
+        return true;
+      case ControlMode::POSITION:
+        if (!homed_) {
+          hold_zero_velocity();
+          RCLCPP_WARN(get_logger(), "POSITION mode needs auto zero first — holding zero velocity (SPEED)");
+          return false;
+        }
+        control_mode_ = ControlMode::POSITION;
+        pos_target_   = cable_length_from_home();
+        return true;
+    }
+    return false;
+  }
+
+  // POSITION mode: P loop on cable length below the stopper, sent as a speed command to
+  // the motor's velocity loop (kp=0, kd=kd_speed). Runs on the unwrapped angle, so the
+  // ±12.5 rad encoder wrap doesn't matter; cable speed is capped at pos_max_speed.
+  MitCommand position_command() const {
+    MitCommand cmd;
+    cmd.kd = kd_speed_;
+    if (pending_pos_hold_) { return cmd; }  // target is stale until first feedback after enable
+    const double err   = pos_target_ - cable_length_from_home();  // m, + = pay out
+    const double v_cab = std::clamp(pos_kp_ * err, -pos_max_speed_, pos_max_speed_);
+    cmd.velocity = -v_cab / drum_radius_;  // paying out is negative motor velocity
+    return cmd;
+  }
+
   std::string homing_state_str() const {
     switch (homing_state_) {
       case HomingState::UNHOMED:     return "unhomed";
@@ -630,8 +692,10 @@ class AkMotorCableControlNode : public rclcpp::Node {
     if (ext_mode_state_ == ExternalModeState::OFF) { return; }
     ext_mode_state_   = ExternalModeState::OFF;
     ext_torque_cmd_   = 0.0;
-    control_mode_     = prev_control_mode_;
-    RCLCPP_INFO(get_logger(), "External mode disabled, control mode restored");
+    // The cable moved under external control: restore the mode as a hold, not with
+    // whatever speed/position command was active before entry.
+    enter_mode_hold(prev_control_mode_);
+    RCLCPP_INFO(get_logger(), "External mode disabled, control mode restored (holding)");
   }
 
   const char* ext_mode_state_str() const {
@@ -696,6 +760,10 @@ class AkMotorCableControlNode : public rclcpp::Node {
 
       update_cable_length(s.position);
       update_homing(s);
+      if (pending_pos_hold_) {  // first feedback after ~/enable
+        if (control_mode_ == ControlMode::POSITION) { pos_target_ = cable_length_from_home(); }
+        pending_pos_hold_ = false;
+      }
       std_msgs::msg::Float32MultiArray cable_state_msg;
       cable_state_msg.data = {static_cast<float>(cable_length_),
                                static_cast<float>(-s.velocity * drum_radius_),
@@ -787,8 +855,13 @@ class AkMotorCableControlNode : public rclcpp::Node {
   double       heartbeat_timeout_ms_{1000.0};
   double       temp_limit_c_{75.0};
   double       kd_speed_{0.5};
-  double       kp_pos_{1.0};
-  double       kd_pos_{0.3};
+  // POSITION mode (metres below the stopper)
+  double       pos_kp_{2.0};              // 1/s
+  double       pos_max_speed_{0.1};       // m/s
+  double       pos_min_length_{0.01};     // m
+  double       pos_max_length_{0.9};      // m
+  double       pos_target_{0.0};          // m
+  bool         pending_pos_hold_{false};  // re-target on next feedback frame
 
   // External mode
   ExternalModeState ext_mode_state_{ExternalModeState::OFF};
@@ -813,14 +886,14 @@ class AkMotorCableControlNode : public rclcpp::Node {
   std::string       homing_fail_reason_;
   bool              homed_{false};                // theta_home_ valid
   double            homing_speed_{1.0};           // rad/s, retract
-  double            homing_kd_{0.4};              // N.m.s/rad
-  double            homing_contact_torque_{0.25}; // N.m
+  double            homing_kd_{0.175};            // N.m.s/rad
+  double            homing_contact_torque_{0.125}; // N.m
   double            homing_stall_speed_{0.2};     // rad/s
   double            homing_debounce_ms_{100.0};
   double            homing_blanking_ms_{300.0};
   double            homing_max_travel_{1.2};      // m
   double            homing_backoff_{0.015};       // m
-  double            homing_timeout_s_{60.0};
+  double            homing_timeout_s_{90.0};
   double            homing_seek_start_theta_{0.0};  // rad, unwrapped
   rclcpp::Time      homing_start_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time      homing_backoff_start_time_{0, 0, RCL_ROS_TIME};
