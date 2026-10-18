@@ -58,6 +58,7 @@ class AkMotorCableControlNode : public rclcpp::Node {
     declare_parameter("temp_limit_c", 75.0);
     declare_parameter("torque_limit_upper",  1.5);   // N.m
     declare_parameter("torque_limit_lower", -1.5);   // N.m
+    declare_parameter("ext_cmd_timeout_ms", 100.0);  // RUNNING without ~/ext_torque_cmd -> STANDBY
     declare_parameter("drum_radius", 0.0175);         // m
     declare_parameter("homing_speed", 1.0);           // rad/s, retract
     declare_parameter("homing_kd", 0.175);            // N.m.s/rad; stall torque cap = kd * speed
@@ -84,6 +85,7 @@ class AkMotorCableControlNode : public rclcpp::Node {
     pos_max_length_ = get_parameter("pos_max_length").as_double();
     torque_limit_upper_ = get_parameter("torque_limit_upper").as_double();
     torque_limit_lower_ = get_parameter("torque_limit_lower").as_double();
+    ext_cmd_timeout_ms_ = get_parameter("ext_cmd_timeout_ms").as_double();
     drum_radius_        = get_parameter("drum_radius").as_double();
     homing_speed_          = get_parameter("homing_speed").as_double();
     homing_kd_             = get_parameter("homing_kd").as_double();
@@ -182,25 +184,22 @@ class AkMotorCableControlNode : public rclcpp::Node {
                 "External torque %.3f N.m exceeds lower limit %.3f N.m — clamped",
                 raw, torque_limit_lower_);
           }
-          ext_torque_cmd_ = std::clamp(raw, torque_limit_lower_, torque_limit_upper_);
+          ext_torque_cmd_     = std::clamp(raw, torque_limit_lower_, torque_limit_upper_);
+          last_ext_cmd_time_  = now();
         });
 
-    // True: STANDBY -> RUNNING.  False: RUNNING -> STANDBY (holds last torque at 0).
+    // True: STANDBY -> RUNNING.  False: RUNNING -> STANDBY (see ext_fall_back_to_standby).
     ext_torque_enable_sub_ = create_subscription<std_msgs::msg::Bool>(
         "~/ext_torque_enable", 10,
         [this](const std_msgs::msg::Bool::SharedPtr msg) {
           if (ext_mode_state_ == ExternalModeState::STANDBY && msg->data) {
-            ext_mode_state_ = ExternalModeState::RUNNING;
+            ext_mode_state_    = ExternalModeState::RUNNING;
+            last_ext_cmd_time_ = now();  // ext_cmd_timeout_ms grace starts at arming
             RCLCPP_INFO(get_logger(), "External mode: STANDBY -> RUNNING");
           } else if (ext_mode_state_ == ExternalModeState::RUNNING && !msg->data) {
-            ext_torque_cmd_        = 0.0;
-            ext_mode_state_        = ExternalModeState::STANDBY;
-            control_mode_          = ControlMode::SPEED;
-            current_cmd_           = MitCommand{};
-            current_cmd_.kd        = kd_speed_;
-            has_command_           = true;
-            last_cmd_time_         = now();
-            RCLCPP_INFO(get_logger(), "External mode: RUNNING -> STANDBY, holding zero velocity");
+            ext_fall_back_to_standby();
+            RCLCPP_INFO(get_logger(), "External mode: RUNNING -> STANDBY, holding %s",
+                        homed_ ? "position" : "zero velocity");
           }
         });
 
@@ -688,6 +687,15 @@ class AkMotorCableControlNode : public rclcpp::Node {
     return "unhomed";
   }
 
+  // RUNNING -> STANDBY (disarm or stale ~/ext_torque_cmd): drop external torque and
+  // hold where the cable is now. POSITION when homed, so a hanging payload stays put;
+  // zero-velocity SPEED otherwise (a payload will sink slowly).
+  void ext_fall_back_to_standby() {
+    ext_torque_cmd_ = 0.0;
+    ext_mode_state_ = ExternalModeState::STANDBY;
+    enter_mode_hold(homed_ ? ControlMode::POSITION : ControlMode::SPEED);
+  }
+
   void disable_external_mode() {
     if (ext_mode_state_ == ExternalModeState::OFF) { return; }
     ext_mode_state_   = ExternalModeState::OFF;
@@ -711,6 +719,14 @@ class AkMotorCableControlNode : public rclcpp::Node {
     check_heartbeat();
     // Covers ~/disable, heartbeat loss and overtemperature (no feedback once disabled).
     if (homing_active() && !enabled_) { fail_homing("motor disabled"); }
+    // External controller died or stalled: don't keep applying its last torque.
+    if (ext_mode_state_ == ExternalModeState::RUNNING &&
+        (now() - last_ext_cmd_time_).nanoseconds() / 1e6 > ext_cmd_timeout_ms_) {
+      ext_fall_back_to_standby();
+      RCLCPP_WARN(get_logger(),
+                  "No ~/ext_torque_cmd for %.0f ms — RUNNING -> STANDBY, holding %s",
+                  ext_cmd_timeout_ms_, homed_ ? "position" : "zero velocity");
+    }
 
     if (enabled_) { send_command(); }
 
@@ -868,6 +884,8 @@ class AkMotorCableControlNode : public rclcpp::Node {
   double            ext_torque_cmd_{0.0};
   double            torque_limit_upper_{1.5};    // N.m
   double            torque_limit_lower_{-1.5};   // N.m
+  double            ext_cmd_timeout_ms_{100.0};
+  rclcpp::Time      last_ext_cmd_time_{0, 0, RCL_ROS_TIME};
 
   // Cable length tracking
   double            drum_radius_{0.0175};         // m

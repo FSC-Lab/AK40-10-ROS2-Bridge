@@ -65,7 +65,7 @@ With default `kp=1.0`, publishing a velocity command has little effect — the p
 | State | Meaning |
 |---|---|
 | `off` | Normal operation — `~/command` and `~/mode_cmd` are active |
-| `standby` | External mode armed; cable length `data[0]` re-zeroed; motor holds zero velocity (SPEED mode) |
+| `standby` | External mode armed; cable length `data[0]` re-zeroed. On entry from `off` the previous mode keeps running; after leaving `running` the motor holds position if homed, zero velocity otherwise |
 | `running` | External torque command from `~/ext_torque_cmd` drives the motor |
 
 Topics and services:
@@ -73,8 +73,8 @@ Topics and services:
 | Name | Type | Direction | Purpose |
 |---|---|---|---|
 | `~/enable_external_mode` | `Trigger` | service | `off → standby`; re-zeros `data[0]` in software; rejects if already active or auto zero is running |
-| `~/ext_torque_enable` | `Bool` | sub | `true`: `standby → running`; `false`: `running → standby` (motor holds zero velocity) |
-| `~/ext_torque_cmd` | `Float32` (N.m) | sub | Torque command; ignored unless `running`; clamped to `[torque_limit_lower, torque_limit_upper]` with `[WARN]` if limit hit |
+| `~/ext_torque_enable` | `Bool` | sub | `true`: `standby → running`; `false`: `running → standby` via `ext_fall_back_to_standby()` |
+| `~/ext_torque_cmd` | `Float32` (N.m) | sub | Torque command; ignored unless `running`; clamped to `[torque_limit_lower, torque_limit_upper]` with `[WARN]` if limit hit. Stale > `ext_cmd_timeout_ms` while `running` → `ext_fall_back_to_standby()` + `[WARN]` |
 | `~/ext_mode_cmd` | `String` | sub | `"off"`: exit external mode, restore previous control mode (as a hold) |
 | `~/ext_mode_state` | `String` | pub | Publishes `"off"` / `"standby"` / `"running"` every poll cycle |
 | `~/control_mode` | `String` | pub | Publishes `"external"` whenever external mode is STANDBY or RUNNING; reverts to `"speed"` / `"torque"` / `"pos"` when `off` |
@@ -82,13 +82,13 @@ Topics and services:
 Correct activation sequence for an external controller node:
 1. Call `~/enable_external_mode` — wait for `success=true`
 2. Confirm `~/ext_mode_state` publishes `"standby"`
-3. Publish `true` on `~/ext_torque_enable`
-4. Confirm `~/ext_mode_state` publishes `"running"`
-5. Start publishing on `~/ext_torque_cmd`
+3. Start publishing on `~/ext_torque_cmd` (ignored until `running`) — both in-package controllers do this from the moment they arm, at 100 Hz
+4. Publish `true` on `~/ext_torque_enable`
+5. Confirm `~/ext_mode_state` publishes `"running"`; keep `~/ext_torque_cmd` coming at least every `ext_cmd_timeout_ms` (default 100 ms)
 
-When done, publish `false` on `~/ext_torque_enable` — the node immediately switches to zero-velocity SPEED mode. The external controller is then responsible for publishing a legitimate velocity command on `~/command`. Publish `"off"` on `~/ext_mode_cmd` to fully exit external mode and restore the previously active control mode as a hold (`enter_mode_hold(prev_control_mode_)` — POSITION holds where the cable is now, not the pre-entry target).
+**Falling back (`ext_fall_back_to_standby()`):** publishing `false` on `~/ext_torque_enable`, or `~/ext_torque_cmd` going stale for `ext_cmd_timeout_ms` (controller crashed/stalled — otherwise its last torque would be applied forever while the GUI heartbeat keeps the motor enabled), drops `running → standby` and calls `enter_mode_hold(homed_ ? POSITION : SPEED)`: a hanging payload is held at the current cable length (sags a few mm under load — the loop has no integral term); unhomed falls back to zero-velocity SPEED, which lets a payload sink. In `standby` the external node may also send `~/mode_cmd` and `~/command` (pos targets in metres below the stopper, or speed) — the node only ignores `~/command` while `running` and does not gate `~/mode_cmd` on external state — then re-arm with `true`. Publish `"off"` on `~/ext_mode_cmd` to fully exit external mode and restore the previously active control mode as a hold (`enter_mode_hold(prev_control_mode_)` — POSITION holds where the cable is now, not the pre-entry target).
 
-**Overtemperature while in external mode:** external mode is cleared, motor is disabled, and the node falls back to zero-velocity SPEED mode (same as the `running → standby` transition).
+**Overtemperature while in external mode:** external mode is cleared, motor is disabled, and the node falls back to zero-velocity SPEED mode (the motor is limp anyway once disabled).
 
 **Cable length re-zero on external mode entry:** `enable_external_mode` sets `pending_rel_rezero_`; on the next feedback frame `theta_rel_ref_` is set to the current unwrapped angle, so `data[0]` reads 0 at entry. The encoder is **not** zeroed (no `set_zero_position`, no MIT exit) — earlier versions cycled `exit_mit_mode → set_zero_position → enter_mit_mode`, which left the motor limp for a moment under load and would have destroyed the auto-zero reference. The reference nodes (sine/triangle/square/pos) are centred on `data[0] = 0`, so they still move relative to the entry point.
 

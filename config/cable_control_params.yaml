@@ -29,6 +29,9 @@ ak_motor_cable_control_node:
     # External mode torque clamp
     torque_limit_upper:  1.5    # N.m  (AK40-10 peak: 1.9 N.m)
     torque_limit_lower: -1.5    # N.m
+    # RUNNING with no ~/ext_torque_cmd for this long -> STANDBY (position hold if homed).
+    # External controllers publish at 100 Hz, so this is ~10 missed commands.
+    ext_cmd_timeout_ms: 100.0
     # Cable drum geometry
     drum_radius: 0.036           # m (36 mm)
     # Auto zero (~/auto_zero): retract until the cable stopper hits the housing.

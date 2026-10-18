@@ -235,6 +235,7 @@ If `~/command` contains non-zero fields that don't belong to the current mode, t
 |---|---|---|
 | `command_timeout_ms` | 500 ms | Drops to `kp=0, kd=kd_watchdog` (pure damping). **Not applied in `pos` mode**, which keeps holding its last target |
 | `heartbeat_timeout_ms` | 1000 ms | Disables motor if **both** heartbeat sources are stale |
+| `ext_cmd_timeout_ms` | 100 ms | External mode `running` with no `~/ext_torque_cmd` → `standby`, holding position if homed (zero velocity otherwise) |
 
 ### Services
 
@@ -358,8 +359,8 @@ External mode allows a separate ROS node to drive the motor with direct torque c
 | Topic / Service | Type | Direction | Purpose |
 |---|---|---|---|
 | `~/enable_external_mode` | `Trigger` | service | `off → standby`; re-zeros cable length `data[0]` in software (encoder untouched, motor never goes limp); rejects if already active or auto zero is running |
-| `~/ext_torque_enable` | `std_msgs/Bool` | sub | `true`: `standby → running`; `false`: `running → standby` (holds zero velocity) |
-| `~/ext_torque_cmd` | `std_msgs/Float32` (N.m) | sub | Torque command; ignored unless `running`; clamped to `[torque_limit_lower, torque_limit_upper]` |
+| `~/ext_torque_enable` | `std_msgs/Bool` | sub | `true`: `standby → running`; `false`: `running → standby`, holding the current cable length if homed (zero velocity otherwise) |
+| `~/ext_torque_cmd` | `std_msgs/Float32` (N.m) | sub | Torque command; ignored unless `running`; clamped to `[torque_limit_lower, torque_limit_upper]`. Must keep arriving at least every `ext_cmd_timeout_ms` (100 ms) while `running`, or the node falls back to `standby` as if disarmed |
 | `~/ext_mode_cmd` | `std_msgs/String` | sub | `"off"`: exit external mode, restore previous control mode |
 | `~/ext_mode_state` | `std_msgs/String` | pub | Publishes `"off"` / `"standby"` / `"running"` at 100 Hz |
 | `~/cable_state` | `std_msgs/Float32MultiArray` | pub | `data[0]` = cable length (m), `data[1]` = cable velocity (m/s), `data[2]` = length below stopper (m, `NaN` until auto zero); active in any mode |
@@ -373,13 +374,14 @@ ros2 service call /ak_motor_cable_control_node/enable_external_mode std_srvs/srv
 # 2. Confirm STANDBY
 ros2 topic echo /ak_motor_cable_control_node/ext_mode_state --once
 
-# 3. Start torque control (STANDBY → RUNNING)
-ros2 topic pub --once /ak_motor_cable_control_node/ext_torque_enable std_msgs/msg/Bool "{data: true}"
-
-# 4. Send a torque command (N.m, clamped to ±1.5 N.m)
+# 3. Start streaming torque (N.m, clamped to ±1.5 N.m) — ignored until RUNNING, and must
+#    not stop for more than ext_cmd_timeout_ms once RUNNING (separate terminal)
 ros2 topic pub --rate 100 /ak_motor_cable_control_node/ext_torque_cmd std_msgs/msg/Float32 "{data: 0.5}"
 
-# 5. Return to STANDBY (holds zero velocity)
+# 4. Start torque control (STANDBY → RUNNING)
+ros2 topic pub --once /ak_motor_cable_control_node/ext_torque_enable std_msgs/msg/Bool "{data: true}"
+
+# 5. Return to STANDBY (holds the current cable length if homed, else zero velocity)
 ros2 topic pub --once /ak_motor_cable_control_node/ext_torque_enable std_msgs/msg/Bool "{data: false}"
 
 # 6. Fully exit external mode
