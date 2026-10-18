@@ -32,6 +32,7 @@ Three layers, each in its own library or executable:
    - `~/zero_position` service: rejects while enabled (same guard as `AkMotorNode`).
    - Sends `exit_mit_mode` on startup to clear any armed state from a previous crashed session.
    - **External mode** for handing torque control to another ROS node (e.g. a cable tension controller). See § External mode below.
+   - **Auto zero** (`~/auto_zero`): homes the cable against a physical stopper. See § Auto zero below.
 
 ## Key design decisions
 
@@ -61,14 +62,14 @@ With default `kp=1.0`, publishing a velocity command has little effect — the p
 | State | Meaning |
 |---|---|
 | `off` | Normal operation — `~/command` and `~/mode_cmd` are active |
-| `standby` | External mode armed; encoder zeroed; motor holds zero velocity (SPEED mode) |
+| `standby` | External mode armed; cable length `data[0]` re-zeroed; motor holds zero velocity (SPEED mode) |
 | `running` | External torque command from `~/ext_torque_cmd` drives the motor |
 
 Topics and services:
 
 | Name | Type | Direction | Purpose |
 |---|---|---|---|
-| `~/enable_external_mode` | `Trigger` | service | `off → standby`; zeros encoder; rejects if already active |
+| `~/enable_external_mode` | `Trigger` | service | `off → standby`; re-zeros `data[0]` in software; rejects if already active or auto zero is running |
 | `~/ext_torque_enable` | `Bool` | sub | `true`: `standby → running`; `false`: `running → standby` (motor holds zero velocity) |
 | `~/ext_torque_cmd` | `Float32` (N.m) | sub | Torque command; ignored unless `running`; clamped to `[torque_limit_lower, torque_limit_upper]` with `[WARN]` if limit hit |
 | `~/ext_mode_cmd` | `String` | sub | `"off"`: exit external mode, restore previous control mode |
@@ -86,13 +87,23 @@ When done, publish `false` on `~/ext_torque_enable` — the node immediately swi
 
 **Overtemperature while in external mode:** external mode is cleared, motor is disabled, and the node falls back to zero-velocity SPEED mode (same as the `running → standby` transition).
 
-**Encoder zero on external mode entry:** `enable_external_mode` always calls `set_zero_position` so that subsequent position feedback can be used for cable length tracking (`cable_length = drum_radius * Δθ`). If the motor is active at entry, the node briefly cycles `exit_mit_mode → set_zero_position → enter_mit_mode`; if already disabled, only `set_zero_position` is sent.
+**Cable length re-zero on external mode entry:** `enable_external_mode` sets `pending_rel_rezero_`; on the next feedback frame `theta_rel_ref_` is set to the current unwrapped angle, so `data[0]` reads 0 at entry. The encoder is **not** zeroed (no `set_zero_position`, no MIT exit) — earlier versions cycled `exit_mit_mode → set_zero_position → enter_mit_mode`, which left the motor limp for a moment under load and would have destroyed the auto-zero reference. The reference nodes (sine/triangle/square/pos) are centred on `data[0] = 0`, so they still move relative to the entry point.
 
-**Cable state tracking:** `~/cable_state` (`Float32MultiArray`) is published on every received CAN feedback frame — **not** gated on external mode:
-- `data[0]` = cable length (m): **decreases** when retracting. Formula: `−drum_radius × θ_accumulated`
+**Cable state tracking:** `~/cable_state` (`Float32MultiArray`) is published on every received CAN feedback frame — **not** gated on external mode. One continuous unwrapped angle `theta_unwrapped_ = θ_raw + rollover_count_ × p_range` feeds two references:
+- `data[0]` = cable length (m): **decreases** when retracting. Formula: `−drum_radius × (theta_unwrapped_ − theta_rel_ref_)`
 - `data[1]` = cable velocity (m/s): **negative** when retracting. Formula: `−ω × drum_radius`
+- `data[2]` = cable length below the stopper (m): `−drum_radius × (theta_unwrapped_ − theta_home_)`; `NaN` unless `homed_`
 
-Sign convention matches positive joint speed = retract. The zero reference is reset in two cases: (1) `enable_external_mode` is called (encoder zeroed at entry); (2) `~/zero_position` service is called (also resets the software tracking state).
+Sign convention matches positive joint speed = retract. `theta_rel_ref_` (zero of `data[0]`) moves on: auto zero contact, `enable_external_mode`, and `~/zero_position`. `theta_home_` (zero of `data[2]`) moves only on auto zero contact. `~/zero_position` zeros the encoder itself, so `reset_cable_length_tracking()` clears every reference and `homed_`.
+
+**Auto zero** (`~/auto_zero`, `HomingState`): retracts until a stopper on the cable hits the housing, then backs off. Run with no payload. Logic lives in `update_homing()` (called per feedback frame after `update_cable_length()`); the motor command comes from the `homing_active()` branch in `send_command()`, ahead of the command-timeout watchdog.
+- `SEEKING`: `kp=0, kd=homing_kd, v=+homing_speed`. The speed loop caps stall torque at `homing_kd × homing_speed` — that bound holds even if detection fails, so keep it small (default 0.4 N.m ≈ 11 N).
+- Contact: `torque ≥ homing_contact_torque && |ω| ≤ homing_stall_speed` for `homing_debounce_ms` (after `homing_blanking_ms`). Sets `theta_home_ = theta_rel_ref_ = theta_unwrapped_`, `homed_ = true`.
+- `BACKING_OFF`: `v = −homing_speed` until `data[2] ≥ homing_backoff`, then `HOMED` with a zero-velocity SPEED hold.
+- `FAILED:<reason>`: any `~/command` / `~/mode_cmd` (GUI Stop/E-stop), `!enabled_` (disable, heartbeat loss, overtemp), travel > `homing_max_travel`, `homing_timeout_s`, velocity < −stall speed (cable dragged out — payload attached), or stalled 1 s without torque reaching the threshold (torque sign/threshold wrong). Clears `homed_`, holds zero velocity.
+- A reversed winding is **not** detectable from motor feedback (encoder and command share the motor frame); `homing_max_travel` is the backstop.
+- With the defaults (cap 0.4 N.m, stall speed 0.2 rad/s, Fc ≈ 0.056 N.m, r = 36 mm), a payload of roughly 0.75–1.5 kg stalls mid-air with torque above the threshold → **false zero**; heavier ones are dragged out (→ `failed`), lighter ones still reach the stopper. This is why homing is payload-free.
+- Published every poll cycle on `~/homing_state` (`String`): `unhomed`, `seeking`, `backing_off`, `homed`, `failed:<reason>`.
 
 Position feedback is 16-bit over `[p_min, p_max]` (default ±12.5 rad). For drums requiring more than 12.5 rad of travel, rollover detection runs inside the node: at 100 Hz polling the maximum Δθ per sample is 0.5 rad, so any raw jump > 12.5 rad is treated as a wrap and `rollover_count_` is incremented/decremented. Drum radius is 36 mm (`drum_radius` parameter, in metres).
 

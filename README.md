@@ -212,6 +212,8 @@ ros2 topic hz /ak_motor_node/joint_state
 | `~/temperature` | node → GUI | `std_msgs/Float32` | Motor temperature (°C) |
 | `~/mode` | node → GUI | `std_msgs/Int8` | Motor mode enum |
 | `~/error_flags` | node → GUI | `std_msgs/UInt8` | Raw error byte |
+| `~/cable_state` | node → GUI | `std_msgs/Float32MultiArray` | `[length (m), velocity (m/s), length below stopper (m) or NaN]` — see § Auto zero |
+| `~/homing_state` | node → GUI | `std_msgs/String` | `unhomed` / `seeking` / `backing_off` / `homed` / `failed:<reason>` |
 
 ### Gains
 
@@ -258,6 +260,63 @@ ros2 topic pub --rate 50 /ak_motor_cable_control_node/command sensor_msgs/msg/Jo
   "{name: ['ak40_10'], position: [0.0], velocity: [1.0], effort: [0.0]}"
 ```
 
+### Auto zero (cable stopper homing)
+
+A stopper part on the cable defines a repeatable zero. `~/auto_zero` retracts the cable
+until the stopper hits the housing, takes that point as zero, then pays out `homing_backoff`
+(default 15 mm) and holds zero velocity. **Run it with no payload attached** — only the
+stopper and hook.
+
+```
+unhomed/homed/failed ──~/auto_zero──► seeking ──contact──► backing_off ──≥ backoff──► homed
+                                         └──────── any abort ────────────┴──► failed:<reason>
+```
+
+- **Retract** uses a speed loop with its own gain: `kp=0, kd=homing_kd, v=+homing_speed`.
+  Stall torque can never exceed `homing_kd × homing_speed` (default 0.4 N.m ≈ 11 N on the
+  cable), so that is the most force the stopper ever sees.
+- **Contact** = measured torque ≥ `homing_contact_torque` AND |velocity| ≤ `homing_stall_speed`,
+  held for `homing_debounce_ms`, after a `homing_blanking_ms` start-up window.
+- **Zero is software-only:** the unwrapped shaft angle at contact is stored; the motor's
+  encoder is not touched, so the motor never goes limp. The zero is lost when the node restarts
+  or `~/zero_position` is called, and if more than ~0.45 m of cable (12.5 rad) is pulled while
+  the motor is disabled (no feedback → rollovers can't be tracked).
+- **Aborts** (→ `failed:<reason>`, zero-velocity SPEED hold): any `~/command` or `~/mode_cmd`
+  (so the GUI Stop / Emergency Stop buttons abort it), motor disabled (incl. heartbeat loss and
+  overtemperature), retract travel > `homing_max_travel`, `homing_timeout_s`, cable pulled out
+  while retracting (payload attached), or a stall where torque never reaches the threshold.
+- Rejected unless the motor is enabled and external mode is `off`. `~/enable_external_mode`
+  is rejected while homing.
+
+`~/cable_state` after homing:
+
+| Field | Meaning | Zero reference |
+|---|---|---|
+| `data[0]` | Cable length (m), positive = paid out | Last of: auto zero contact, external mode entry, `~/zero_position` |
+| `data[1]` | Cable velocity (m/s), negative = retracting | — |
+| `data[2]` | Cable length below the stopper (m); `NaN` until homed | Auto zero contact (not reset by external mode) |
+
+```bash
+ros2 service call /ak_motor_cable_control_node/enable std_srvs/srv/Trigger
+ros2 service call /ak_motor_cable_control_node/auto_zero std_srvs/srv/Trigger
+ros2 topic echo /ak_motor_cable_control_node/homing_state
+# Abort: publish any command (this is what the GUI Stop button does)
+ros2 topic pub --once /ak_motor_cable_control_node/command sensor_msgs/msg/JointState \
+  "{name: ['ak40_10'], position: [0.0], velocity: [0.0], effort: [0.0]}"
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `homing_speed` | `1.0` rad/s | Retract / back-off speed (~36 mm/s) |
+| `homing_kd` | `0.4` N.m.s/rad | Speed-loop gain; stall cap = `homing_kd × homing_speed` |
+| `homing_contact_torque` | `0.25` N.m | Measured torque threshold (must be below the stall cap) |
+| `homing_stall_speed` | `0.2` rad/s | Below this counts as stalled |
+| `homing_debounce_ms` | `100` | Contact must hold this long |
+| `homing_blanking_ms` | `300` | Start-up window ignored (breakaway) |
+| `homing_max_travel` | `1.2` m | Retract distance before giving up |
+| `homing_backoff` | `0.015` m | Pay-out after contact (park position) |
+| `homing_timeout_s` | `60` s | Overall seek timeout |
+
 ### External mode
 
 External mode allows a separate ROS node to drive the motor with direct torque commands. The cable control node acts as the authority gate — only it can open and close external mode.
@@ -266,17 +325,17 @@ External mode allows a separate ROS node to drive the motor with direct torque c
 
 | Topic / Service | Type | Direction | Purpose |
 |---|---|---|---|
-| `~/enable_external_mode` | `Trigger` | service | `off → standby`; zeros encoder; rejects if already active |
+| `~/enable_external_mode` | `Trigger` | service | `off → standby`; re-zeros cable length `data[0]` in software (encoder untouched, motor never goes limp); rejects if already active or auto zero is running |
 | `~/ext_torque_enable` | `std_msgs/Bool` | sub | `true`: `standby → running`; `false`: `running → standby` (holds zero velocity) |
 | `~/ext_torque_cmd` | `std_msgs/Float32` (N.m) | sub | Torque command; ignored unless `running`; clamped to `[torque_limit_lower, torque_limit_upper]` |
 | `~/ext_mode_cmd` | `std_msgs/String` | sub | `"off"`: exit external mode, restore previous control mode |
 | `~/ext_mode_state` | `std_msgs/String` | pub | Publishes `"off"` / `"standby"` / `"running"` at 100 Hz |
-| `~/cable_state` | `std_msgs/Float32MultiArray` | pub | `data[0]` = cable length (m), `data[1]` = cable velocity (m/s); active in any mode |
+| `~/cable_state` | `std_msgs/Float32MultiArray` | pub | `data[0]` = cable length (m), `data[1]` = cable velocity (m/s), `data[2]` = length below stopper (m, `NaN` until auto zero); active in any mode |
 
 **Manual activation sequence:**
 
 ```bash
-# 1. Enable external mode (zeros encoder, enters STANDBY)
+# 1. Enable external mode (re-zeros cable length data[0], enters STANDBY)
 ros2 service call /ak_motor_cable_control_node/enable_external_mode std_srvs/srv/Trigger
 
 # 2. Confirm STANDBY

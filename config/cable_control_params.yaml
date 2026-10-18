@@ -28,3 +28,14 @@ ak_motor_cable_control_node:
     torque_limit_lower: -1.5    # N.m
     # Cable drum geometry
     drum_radius: 0.036           # m (36 mm)
+    # Auto zero (~/auto_zero): retract until the cable stopper hits the housing.
+    # Run with no payload. Stall torque cap = homing_kd * homing_speed (0.4 N.m ~ 11 N on cable).
+    homing_speed:          1.0     # rad/s retract (~36 mm/s)
+    homing_kd:             0.4     # N.m.s/rad
+    homing_contact_torque: 0.25    # N.m measured torque => contact (must be < kd * speed)
+    homing_stall_speed:    0.2     # rad/s, |vel| below this counts as stalled
+    homing_debounce_ms:    100.0   # contact must hold this long
+    homing_blanking_ms:    300.0   # ignore breakaway at start
+    homing_max_travel:     1.2     # m retracted before giving up
+    homing_backoff:        0.015   # m paid out after contact (park position)
+    homing_timeout_s:      60.0
