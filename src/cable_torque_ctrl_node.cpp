@@ -3,6 +3,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32.hpp>
@@ -25,7 +31,8 @@ static constexpr double kGravity = 9.81;  // m/s²
 //      tau_eq = r·M_eff_hat·(a_dyn − kp_c·e_v) + m_hat·g·r + tau_f
 //
 //   2. Friction feedforward (fixed calibrated params, shaft-referenced):
-//      tau_f  = Fc·tanh(ω/deadband) + Fv·ω
+//      tau_f  = (Fc + k_load·m·g·r)·tanh(ω/deadband) + Fv·ω
+//      (k_load = friction_load_gain: the drum's friction grows with cable tension; 0 = fixed Fc)
 //      (included in tau_eq above; separated in debug output)
 //
 //   3. SMC switching term (L1-adapted):
@@ -90,6 +97,7 @@ class CableTorqueCtrlNode : public rclcpp::Node {
     declare_parameter("coulomb_friction",           0.0203);  // N.m
     declare_parameter("viscous_drag",               0.00140); // N.m·s/rad
     declare_parameter("friction_velocity_deadband", 0.5);     // rad/s
+    declare_parameter("friction_load_gain",         0.0);     // Coulomb N.m per N.m of m·g·r
     // L1 adaptive
     declare_parameter("l1_as",          50.0);    // rad/s  state predictor gain
     declare_parameter("l1_gamma_1",      5.0);    // adaptation gain for theta_1
@@ -113,6 +121,7 @@ class CableTorqueCtrlNode : public rclcpp::Node {
     coulomb_friction_           = get_parameter("coulomb_friction").as_double();
     viscous_drag_               = get_parameter("viscous_drag").as_double();
     friction_velocity_deadband_ = get_parameter("friction_velocity_deadband").as_double();
+    friction_load_gain_         = get_parameter("friction_load_gain").as_double();
     l1_as_                      = get_parameter("l1_as").as_double();
     l1_gamma_1_                 = get_parameter("l1_gamma_1").as_double();
     l1_gamma_2_                 = get_parameter("l1_gamma_2").as_double();
@@ -131,9 +140,7 @@ class CableTorqueCtrlNode : public rclcpp::Node {
     }
 
     // Compute nominal theta values from identified parameters; used for L1 initialization and reset.
-    const double M_eff_nom = ude_inertia_ / (drum_radius_ * drum_radius_) + mass_;
-    l1_theta_1_nom_        = 1.0 / (drum_radius_ * M_eff_nom);   // 1/(r·M_eff_nom)
-    l1_theta_2_nom_        = -mass_ * kGravity / M_eff_nom;      // -mg/M_eff_nom  (m/s²)
+    update_l1_nominal();
     reset_l1();
 
     // Publishers
@@ -215,15 +222,129 @@ class CableTorqueCtrlNode : public rclcpp::Node {
                 "  L1: a_s=%.1f, gamma=[%.2f,%.2f], omega_f=%.2f rad/s, "
                 "theta1_nom=%.3f, theta1_min=%.2f\n"
                 "  UDE: lambda=%.1f rad/s, limit=%.3f N.m",
-                mass_, drum_radius_, ude_inertia_, M_eff_nom,
+                mass_, drum_radius_, ude_inertia_,
+                ude_inertia_ / (drum_radius_ * drum_radius_) + mass_,
                 kp_c_, smc_eta_, smc_phi_,
                 coulomb_friction_, viscous_drag_, friction_velocity_deadband_,
                 l1_as_, l1_gamma_1_, l1_gamma_2_, l1_omega_f_,
                 l1_theta_1_nom_, l1_theta_1_min_,
                 ude_lambda_, ude_integral_limit_);
+
+    // Live tuning: mass, kp_c, smc_eta, smc_phi may be changed while the node runs, armed or
+    // not (ros2 param set, or the slung ground station's Tuning tab, which sets all four
+    // atomically). Every other parameter is read at startup only and a set is REFUSED, rather
+    // than silently accepted and ignored as it used to be.
+    param_cb_ = add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter>& ps) { return on_set_parameters(ps); });
+    RCLCPP_INFO(get_logger(), "Live-tunable: mass, kp_c, smc_eta, smc_phi, coulomb_friction, "
+                "friction_load_gain (%s)",
+                gains_text().c_str());
   }
 
  private:
+  // L1 nominal thetas from drum_radius, mass and ude_inertia: the values L1 starts from on arm,
+  // disarm and startup.
+  // Coulomb friction used by the feedforward: the drum's friction grows with the cable
+  // tension (measured 2026-11: 0.042 N.m at 150 g, 0.065 at 567 g on the 0.18 m/s triangle
+  // ramps), so it is coulomb_friction + friction_load_gain x (mass g r), mass = the configured one.
+  double coulomb_effective() const {
+    return coulomb_friction_ + friction_load_gain_ * mass_ * kGravity * drum_radius_;
+  }
+
+  void update_l1_nominal() {
+    const double M_eff_nom = ude_inertia_ / (drum_radius_ * drum_radius_) + mass_;
+    l1_theta_1_nom_        = 1.0 / (drum_radius_ * M_eff_nom);   // 1/(r·M_eff_nom)
+    l1_theta_2_nom_        = -mass_ * kGravity / M_eff_nom;      // -mg/M_eff_nom  (m/s²)
+  }
+
+  // The gains with their PD equivalent. Inside the boundary layer (|s| <= phi) the law is a PD
+  // on the cable position error (in acceleration units, scaled by r·M_eff_hat):
+  //   e_p'' + Kd e_p' + Kp e_p = 0,  Kd = kp_c + eta/phi,  Kp = eta·kp_c/phi
+  // Outside it (|e_p| > phi/kp_c at rest) the correction saturates at eta m/s².
+  std::string gains_text() const {
+    const double kp = smc_eta_ * kp_c_ / smc_phi_;
+    const double kd = kp_c_ + smc_eta_ / smc_phi_;
+    const double wn = std::sqrt(std::max(kp, 0.0));
+    std::ostringstream o;
+    o << std::fixed << std::setprecision(3) << "mass " << mass_ << " kg, kp_c " << kp_c_
+      << ", eta " << smc_eta_ << ", phi " << smc_phi_ << std::setprecision(2) << " -> PD Kp "
+      << kp << " 1/s^2, Kd " << kd << " 1/s, wn " << wn << " rad/s, zeta "
+      << (wn > 0.0 ? kd / (2.0 * wn) : 0.0) << ", linear within " << std::setprecision(1)
+      << 1e3 * smc_phi_ / kp_c_ << " mm" << std::setprecision(4) << "; friction Fc "
+      << coulomb_friction_ << " + " << friction_load_gain_ << " x m g r = " << coulomb_effective()
+      << " N.m";
+    return o.str();
+  }
+
+  rcl_interfaces::msg::SetParametersResult on_set_parameters(
+      const std::vector<rclcpp::Parameter>& ps) {
+    rcl_interfaces::msg::SetParametersResult res;
+    res.successful = true;
+    // read at startup only: a set would otherwise "succeed" and change nothing
+    static const std::set<std::string> kStartupOnly = {
+        "drum_radius", "sat_upper", "sat_lower", "motor_direction", "poll_rate_hz",
+        "reference_timeout_ms", "viscous_drag", "friction_velocity_deadband",
+        "l1_as", "l1_gamma_1", "l1_gamma_2", "l1_omega_f", "l1_theta_1_min",
+        "ude_lambda", "ude_inertia", "ude_integral_limit"};
+    // validate everything first: a rejected set (atomic or not) changes nothing
+    double mass = mass_, kp_c = kp_c_, eta = smc_eta_, phi = smc_phi_;
+    double fc = coulomb_friction_, k_load = friction_load_gain_;
+    const auto fail = [&res](const std::string& why) {
+      if (res.successful) { res.successful = false; res.reason = why; }
+    };
+    for (const auto& p : ps) {
+      const std::string& n = p.get_name();
+      if (kStartupOnly.count(n)) {
+        fail(n + " is read at startup only: relaunch to change it");
+        continue;
+      }
+      double lo = 0.0, hi = 0.0;
+      double* dst = nullptr;
+      if (n == "mass")         { lo = 0.05; hi = 3.0;  dst = &mass; }
+      else if (n == "kp_c")    { lo = 0.1;  hi = 30.0; dst = &kp_c; }
+      else if (n == "smc_eta") { lo = 0.0;  hi = 20.0; dst = &eta; }
+      else if (n == "smc_phi") { lo = 0.01; hi = 1.0;  dst = &phi; }
+      else if (n == "coulomb_friction")   { lo = 0.0; hi = 0.2; dst = &fc; }
+      else if (n == "friction_load_gain") { lo = 0.0; hi = 1.0; dst = &k_load; }
+      else { continue; }  // not ours (use_sim_time, ...)
+      if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+        fail(n + " must be a double (write 5.0, not 5)");
+        continue;
+      }
+      const double v = p.as_double();
+      if (!(v >= lo && v <= hi)) {
+        std::ostringstream o;
+        o << n << " = " << v << " is outside [" << lo << ", " << hi << "]";
+        fail(o.str());
+        continue;
+      }
+      *dst = v;
+    }
+    if (!res.successful) {
+      RCLCPP_WARN(get_logger(), "Parameter set refused: %s", res.reason.c_str());
+      return res;
+    }
+    const std::string before = gains_text();
+    const bool mass_changed = mass != mass_;
+    mass_ = mass;
+    kp_c_ = kp_c;
+    smc_eta_ = eta;
+    smc_phi_ = phi;
+    coulomb_friction_ = fc;
+    friction_load_gain_ = k_load;
+    if (mass_changed) {
+      update_l1_nominal();
+      // Disarmed: start L1 from the new mass now. Armed: L1 keeps its live estimate (resetting
+      // it mid-run would step the gravity torque); the new mass is where it starts next arm.
+      if (!armed_) { reset_l1(); }
+    }
+    res.reason = gains_text() + (mass_changed && armed_ ? " (mass: from the next arm)" : "");
+    RCLCPP_INFO(get_logger(), "Gains changed%s:\n  was %s\n  now %s%s", armed_ ? " WHILE ARMED" : "",
+                before.c_str(), gains_text().c_str(),
+                mass_changed && armed_ ? "\n  mass applies to L1 from the next arm" : "");
+    return res;
+  }
+
   void do_disarm() {
     armed_ = false;
     reset_ude();
@@ -275,7 +396,7 @@ class CableTorqueCtrlNode : public rclcpp::Node {
     const double a_dyn = acc_ref - kGravity;
 
     // ── Friction feedforward ────────────────────────────────────────────────
-    const double tau_f = coulomb_friction_ * std::tanh(omega / friction_velocity_deadband_)
+    const double tau_f = coulomb_effective() * std::tanh(omega / friction_velocity_deadband_)
                        + viscous_drag_ * omega;
 
     // ── L1 adaptive (§9, BLSMC_design.md) ─────────────────────────────────
@@ -365,6 +486,7 @@ class CableTorqueCtrlNode : public rclcpp::Node {
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr disarm_srv_;
 
   rclcpp::TimerBase::SharedPtr poll_timer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
 
   // Live state
   double p_c_{0.0};  // actual cable position (m), retract-positive
@@ -397,6 +519,7 @@ class CableTorqueCtrlNode : public rclcpp::Node {
   double coulomb_friction_{0.0559};          // N.m
   double viscous_drag_{0.00038};             // N.m·s/rad
   double friction_velocity_deadband_{0.5};   // rad/s
+  double friction_load_gain_{0.0};           // N.m of Coulomb friction per N.m of m·g·r
   // L1 parameters
   double l1_as_{50.0};          // state predictor gain
   double l1_gamma_1_{5.0};      // adaptation gain for theta_1
