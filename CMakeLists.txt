@@ -78,6 +78,22 @@ add_executable(cable_direct_torque_node src/cable_direct_torque_node.cpp)
 target_compile_features(cable_direct_torque_node PRIVATE cxx_std_17)
 ament_target_dependencies(cable_direct_torque_node ${_deps})
 
+# ── Isaac Sim stand-in for the cable node (AK_BUILD_SIM) ──────────────────────
+# The same src/ak_motor_cable_control_node.cpp, linked against sim/sim_can_socket.cpp instead of the SocketCAN
+# wrapper: the CAN bus is replaced by /ak_sim/{mit_cmd,motor_state} to an Isaac Sim drum model
+# (fsc_PegasusSimulator application/slungload/px4_x650_slung_load_ak_winch.py). launch/cable_control_sim.launch.py
+# runs it under the real node name. No dependencies beyond those of the real node.
+option(AK_BUILD_SIM "Build ak_motor_cable_control_node_sim (simulated CAN bus for Isaac Sim)" ON)
+if(AK_BUILD_SIM)
+  add_executable(ak_motor_cable_control_node_sim
+    src/ak_motor_cable_control_node.cpp src/ak40_codec.cpp sim/sim_can_socket.cpp)
+  target_include_directories(ak_motor_cable_control_node_sim PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_compile_features(ak_motor_cable_control_node_sim PRIVATE cxx_std_17)
+  ament_target_dependencies(ak_motor_cable_control_node_sim ${_deps})
+  install(TARGETS ak_motor_cable_control_node_sim RUNTIME DESTINATION lib/${PROJECT_NAME})
+endif()
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS can_socket ak40_codec ak_motor_node slung_load_node
   ak_motor_cable_control_node cable_torque_ctrl_node cable_sine_ref_node
